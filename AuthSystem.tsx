@@ -1,276 +1,173 @@
 import React, { useState, useEffect } from "react";
-import { 
-  BookOpen, Volume2, VolumeX, Sparkles, Headphones, CheckCircle, HelpCircle, ArrowRight
-} from "lucide-react";
-import { ExplanationSection, User } from "../types";
-import { speakText as speakTtsText, stopTts } from "../lib/tts";
+import { Sparkles, Upload, Video, Image, Check, Trash2, Eye, EyeOff } from "lucide-react";
 
-interface AIExplanationViewProps {
-  sections: ExplanationSection[];
-  documentTitle: string;
-  user: User;
-  onStartQuiz: () => void;
+interface WallpaperSystemProps {
+  activeWallpaper: { type: "color" | "image" | "video"; value: string };
+  onWallpaperChange: (wp: { type: "color" | "image" | "video"; value: string }) => void;
+  wallpaperGlassMode: boolean;
+  onToggleGlassMode: () => void;
 }
 
-export default function AIExplanationView({ sections, documentTitle, user, onStartQuiz }: AIExplanationViewProps) {
-  // Voice playback states
-  const [isPlayingVoice, setIsPlayingVoice] = useState(false);
-  const voiceType: "male" | "female" = "female";
-  const [ttsErrorMessage, setTtsErrorMessage] = useState("");
-  const [speechSpeed, setSpeechSpeed] = useState<number>(() => {
-    const saved = localStorage.getItem("tts_speed");
-    return saved ? parseFloat(saved) : 1.0;
-  });
+export const PRESET_WALLPAPERS: { id: string; name: string; type: "color" | "image" | "video"; value: string }[] = [
+  { id: "wp_slate", name: "Slate Dark", type: "color", value: "bg-slate-950" },
+  { id: "wp_rain_moving", name: "Yomg'ir Tomchilari (Moving)", type: "video", value: "https://assets.mixkit.co/videos/preview/mixkit-raindrops-falling-on-a-window-pane-14187-large.mp4" },
+  { id: "wp_tree_moving", name: "Tebranayotgan Daraxt (Moving)", type: "video", value: "https://assets.mixkit.co/videos/preview/mixkit-dense-green-forest-trees-swaying-in-the-wind-39906-large.mp4" },
+  { id: "wp_code_moving", name: "IT Dasturchi Matritsa (Moving)", type: "video", value: "https://assets.mixkit.co/videos/preview/mixkit-glowing-digital-binary-code-background-48766-large.mp4" },
+  { id: "wp_cosmic", name: "Cosmic Glow", type: "image", value: "https://images.unsplash.com/photo-1534796636912-3b95b3ab5986?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_amber_silk", name: "Minimalist Amber Wave", type: "image", value: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_neural", name: "Global Neural Network", type: "image", value: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_cyber_tech", name: "Cyber Tech Grid", type: "image", value: "https://images.unsplash.com/photo-1550751827-4bd374c3f58b?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_starry_peak", name: "Starry Mountain Peaks", type: "image", value: "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_fluid_gradient", name: "Premium Fluid Dark", type: "image", value: "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?auto=format&fit=crop&w=1920&q=80" },
+  { id: "wp_abstract_acrylic", name: "Abstract Fluid Acrylic", type: "image", value: "https://images.unsplash.com/photo-1541701494587-cb58502866ab?auto=format&fit=crop&w=1920&q=80" }
+];
 
-  const handleCycleSpeed = () => {
-    const speeds = [1.0, 1.25, 1.5, 1.75, 2.0];
-    const currentIndex = speeds.indexOf(speechSpeed);
-    const nextIndex = (currentIndex + 1) % speeds.length;
-    const nextSpeed = speeds[nextIndex];
-    setSpeechSpeed(nextSpeed);
-    localStorage.setItem("tts_speed", nextSpeed.toString());
-    logTelemetryAction("Change voice speed", `Ovoz tezligini "${nextSpeed}x" qilib o'zgartirdi.`);
-  };
+export default function WallpaperSystem({ 
+  activeWallpaper, onWallpaperChange, wallpaperGlassMode, onToggleGlassMode 
+}: WallpaperSystemProps) {
+  const [customWallpapers, setCustomWallpapers] = useState<{ id: string; name: string; type: "image" | "video"; value: string }[]>([]);
 
   useEffect(() => {
-    // Record learning activity
-    logTelemetryAction("Start explanation reading", `"${documentTitle}" tushuntirish matnini to'liq o'qishni boshladi.`);
-    return () => {
-      stopVoice();
+    const saved = localStorage.getItem("custom_wallpapers");
+    if (saved) {
+      try {
+        setCustomWallpapers(JSON.parse(saved));
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }, []);
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const isVideo = file.type.startsWith("video/");
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = reader.result as string;
+      const newWp = {
+        id: `custom_${Date.now()}`,
+        name: file.name.slice(0, 15) + "...",
+        type: isVideo ? ("video" as const) : ("image" as const),
+        value
+      };
+      const updated = [newWp, ...customWallpapers];
+      setCustomWallpapers(updated);
+      localStorage.setItem("custom_wallpapers", JSON.stringify(updated));
+      onWallpaperChange({ type: newWp.type, value: newWp.value });
     };
-  }, [documentTitle]);
-
-  const logTelemetryAction = async (action: string, details: string) => {
-    try {
-      await fetch("/api/telemetry/action", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: user.id,
-          userName: user.name,
-          action,
-          details,
-          deviceInfo: {
-            browser: "Chrome",
-            os: navigator.platform,
-            deviceType: window.innerWidth < 768 ? "Mobile" : "Desktop"
-          }
-        })
-      });
-    } catch (e) {
-      console.error(e);
-    }
+    reader.readAsDataURL(file);
   };
 
-  const speakEntireDocument = async () => {
-    if (isPlayingVoice) {
-      stopVoice();
-      return;
-    }
-
-    // Combine all sections for a single continuous reading experience
-    const textParts: string[] = [];
-    textParts.push(`Mavzu: ${documentTitle}.`);
-    
-    sections.forEach((sec, idx) => {
-      textParts.push(`Bo'lim: ${sec.title}.`);
-      textParts.push(`${sec.summary}.`);
-      textParts.push(`${sec.content}.`);
-      if (sec.example) {
-        textParts.push(`Misol uchun: ${sec.example}.`);
-      }
-    });
-
-    const textToSpeak = textParts.join(" ");
-    setIsPlayingVoice(true);
-    setTtsErrorMessage("");
-
-    speakTtsText(
-      textToSpeak,
-      voiceType,
-      () => {
-        setIsPlayingVoice(true);
-        setTtsErrorMessage("");
-      },
-      () => {
-        setIsPlayingVoice(false);
-      },
-      (err) => {
-        setTtsErrorMessage(err);
-      }
-    );
-  };
-
-  const stopVoice = () => {
-    setIsPlayingVoice(false);
-    stopTts();
+  const deleteCustom = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const updated = customWallpapers.filter(w => w.id !== id);
+    setCustomWallpapers(updated);
+    localStorage.setItem("custom_wallpapers", JSON.stringify(updated));
   };
 
   return (
-    <div id="explanation-view-root" className="w-full max-w-3xl mx-auto space-y-6 relative z-10 p-2 sm:p-4">
-      
-      {/* Top sticky-like reader control toolbar */}
-      <div className="flex flex-col md:flex-row items-center justify-between gap-4 p-4 sm:p-5 bg-slate-900/90 backdrop-blur-md rounded-2xl border border-slate-800/80 shadow-2xl">
-        <div className="flex items-center gap-3">
-          <div className="p-2.5 bg-amber-500/10 text-amber-500 rounded-xl border border-amber-500/20">
-            <BookOpen className="w-5 h-5" />
-          </div>
-          <div>
-            <span className="text-[10px] uppercase font-bold text-amber-500 tracking-wider">Mavzu darsligi</span>
-            <h2 className="text-sm font-bold text-slate-100 font-display truncate max-w-[250px] sm:max-w-[350px]">
-              {documentTitle}
-            </h2>
-          </div>
+    <div id="wallpaper-manager" className="space-y-4">
+      <div className="flex items-center justify-between gap-4 mb-2">
+        <div className="flex items-center gap-2">
+          <Sparkles className="w-5 h-5 text-amber-500" />
+          <h3 className="text-sm font-semibold text-slate-200">Fon va Fon rasmlari</h3>
         </div>
-
-        {/* Audio control panel */}
-        <div className="flex flex-wrap items-center gap-3 w-full md:w-auto justify-end">
-          {/* Speed selector button with downward-pointing triangle */}
-          <button
-            onClick={handleCycleSpeed}
-            title="Gapirish tezligini oshirish"
-            className="px-3 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 text-amber-400 hover:text-amber-300 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-md"
-          >
-            <svg className="w-3 h-3 text-amber-400 fill-current" viewBox="0 0 24 24">
-              <path d="M21 6H3L12 18L21 6Z" />
-            </svg>
-            <span className="font-mono">{speechSpeed.toFixed(2)}x</span>
-          </button>
-
-          <button
-            onClick={speakEntireDocument}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
-              isPlayingVoice 
-                ? "bg-red-500/15 text-red-400 border border-red-500/30 animate-pulse hover:bg-red-500/25" 
-                : "bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-lg"
-            }`}
-          >
-            {isPlayingVoice ? (
-              <>
-                <VolumeX className="w-4 h-4 stroke-[2.5]" />
-                Ovozni O'chirish
-              </>
-            ) : (
-              <>
-                <Volume2 className="w-4 h-4 stroke-[2.5]" />
-                Matnni Ovozli Eshitish
-              </>
-            )}
-          </button>
-        </div>
+        
+        {/* Toggle Mirror/Glass mode */}
+        <button
+          type="button"
+          onClick={onToggleGlassMode}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-bold border transition-all ${
+            wallpaperGlassMode
+              ? "bg-amber-500/15 text-amber-400 border-amber-500/35"
+              : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+          }`}
+          title="Oyna (Glass Mirror) effekti orqali orqa fonni tiniq qilish"
+        >
+          {wallpaperGlassMode ? <Eye className="w-3.5 h-3.5 text-amber-400" /> : <EyeOff className="w-3.5 h-3.5" />}
+          {wallpaperGlassMode ? "Oyna: Yoqilgan" : "Oyna: O'chirilgan"}
+        </button>
       </div>
 
-      {/* Interactive spectrum shown when audio is playing */}
-      {isPlayingVoice && (
-        <div className="flex items-center justify-center gap-1.5 p-3 bg-amber-500/5 border border-amber-500/10 rounded-xl">
-          <div className="w-1.5 h-3.5 bg-amber-500 rounded animate-bounce [animation-delay:0.1s]" />
-          <div className="w-1.5 h-5.5 bg-amber-500 rounded animate-bounce [animation-delay:0.2s]" />
-          <div className="w-1.5 h-7 bg-amber-500 rounded animate-bounce [animation-delay:0.3s]" />
-          <div className="w-1.5 h-4.5 bg-amber-500 rounded animate-bounce [animation-delay:0.4s]" />
-          <div className="w-1.5 h-6 bg-amber-500 rounded animate-bounce [animation-delay:0.5s]" />
-          <span className="text-[10px] text-amber-400 font-semibold uppercase tracking-wider ml-2 font-mono">
-            AI o'qituvchi matnni ovozli o'qimoqda...
-          </span>
-        </div>
-      )}
-
-      {ttsErrorMessage && (
-        <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-[11px] rounded-xl text-center">
-          {ttsErrorMessage}
-        </div>
-      )}
-
-      {/* Unified Book/Dictation Sheet Canvas */}
-      <div className="bg-slate-950/50 backdrop-blur-sm border border-slate-800/80 rounded-3xl p-6 sm:p-10 shadow-2xl space-y-10 relative overflow-hidden">
-        
-        {/* Aesthetic header details simulating a notebook sheet */}
-        <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-amber-500 via-cyan-500 to-amber-500 opacity-60" />
-        
-        <div className="text-center space-y-2 border-b border-slate-800/60 pb-8">
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight leading-tight">
-            {documentTitle}
-          </h1>
-          <p className="text-xs text-slate-400 font-medium tracking-wide">
-            Tizim tomonidan tayyorlangan diktant va o'quv darsligi
-          </p>
-        </div>
-
-        {/* Continuous Linear Text Flow */}
-        <div className="space-y-12">
-          {sections.map((sec, idx) => (
-            <div key={sec.id || idx} className="space-y-5 animate-fade-in">
-              {/* Section Sub-title */}
-              <h3 className="text-base sm:text-lg font-bold text-amber-400 flex items-center gap-2 pb-1 border-b border-slate-800/40">
-                <span className="text-xs font-mono font-bold bg-amber-500/10 text-amber-500 px-2.5 py-1 rounded-lg">
-                  {idx + 1}
-                </span>
-                {sec.title}
-              </h3>
-
-              {/* Summary Accent Box inline */}
-              <p className="text-sm sm:text-base leading-relaxed text-slate-300 font-medium pl-4 border-l-2 border-amber-500/50 bg-amber-500/[0.02] py-2 rounded-r-lg">
-                {sec.summary}
-              </p>
-
-              {/* Detailed Explanation Paragraphs */}
-              <div className="text-slate-100 text-sm sm:text-base leading-relaxed space-y-4 font-normal">
-                <p className="whitespace-pre-line text-slate-200/95 tracking-wide">
-                  {sec.content}
-                </p>
-              </div>
-
-              {/* Case Study Example if provided */}
-              {sec.example && (
-                <div className="p-4 bg-cyan-500/[0.03] border border-cyan-500/10 rounded-2xl space-y-1.5">
-                  <h4 className="text-[10px] font-extrabold text-cyan-400 uppercase tracking-widest flex items-center gap-1.5">
-                    <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-                    Hayotiy Misol:
-                  </h4>
-                  <p className="text-slate-300 text-xs sm:text-sm leading-relaxed">
-                    "{sec.example}"
-                  </p>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        {/* Presets */}
+        {PRESET_WALLPAPERS.map((wp) => {
+          const isActive = activeWallpaper.value === wp.value;
+          return (
+            <button
+              key={wp.id}
+              onClick={() => onWallpaperChange({ type: wp.type, value: wp.value })}
+              className={`relative h-20 rounded-xl overflow-hidden group border transition-all text-left flex flex-col justify-end p-2 ${
+                isActive ? "border-amber-500 ring-2 ring-amber-500/20" : "border-slate-800 hover:border-slate-700"
+              }`}
+            >
+              {wp.type === "color" ? (
+                <div className={`absolute inset-0 ${wp.value}`} />
+              ) : wp.type === "video" ? (
+                <div className="absolute inset-0 bg-slate-900">
+                  <video src={wp.value} muted loop className="w-full h-full object-cover opacity-60" />
+                </div>
+              ) : (
+                <img src={wp.value} className="absolute inset-0 w-full h-full object-cover opacity-60" referrerPolicy="no-referrer" />
+              )}
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/80 via-transparent to-transparent" />
+              <span className="relative text-[11px] font-medium text-slate-100 z-10 truncate flex items-center gap-1">
+                {wp.type === "video" ? <Video className="w-3 h-3 text-amber-400" /> : <Image className="w-3 h-3 text-cyan-400" />}
+                {wp.name}
+              </span>
+              {isActive && (
+                <div className="absolute top-2 right-2 bg-amber-500 rounded-full p-0.5 z-10">
+                  <Check className="w-3 h-3 text-slate-950 stroke-[3]" />
                 </div>
               )}
+            </button>
+          );
+        })}
 
-              {/* Integrated Concept Terms if provided */}
-              {sec.concepts && sec.concepts.length > 0 && (
-                <div className="mt-4 p-4 bg-slate-900/40 border border-slate-800/60 rounded-2xl space-y-3">
-                  <h4 className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
-                    <HelpCircle className="w-3.5 h-3.5 text-slate-400" />
-                    Asosiy Atamalar:
-                  </h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {sec.concepts.map((concept, cIdx) => (
-                      <div key={cIdx} className="p-3 bg-slate-950/80 rounded-xl border border-slate-850 space-y-0.5">
-                        <span className="text-xs font-bold text-cyan-400">{concept.term}</span>
-                        <p className="text-[11px] text-slate-400 leading-relaxed">{concept.definition}</p>
-                      </div>
-                    ))}
-                  </div>
+        {/* Custom Uploads */}
+        {customWallpapers.map((wp) => {
+          const isActive = activeWallpaper.value === wp.value;
+          return (
+            <div
+              key={wp.id}
+              onClick={() => onWallpaperChange({ type: wp.type, value: wp.value })}
+              className={`relative h-20 rounded-xl overflow-hidden group border cursor-pointer transition-all flex flex-col justify-end p-2 ${
+                isActive ? "border-amber-500 ring-2 ring-amber-500/20" : "border-slate-800 hover:border-slate-700"
+              }`}
+            >
+              {wp.type === "video" ? (
+                <video src={wp.value} muted loop className="absolute inset-0 w-full h-full object-cover opacity-50" />
+              ) : (
+                <img src={wp.value} className="absolute inset-0 w-full h-full object-cover opacity-50" referrerPolicy="no-referrer" />
+              )}
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/80 via-transparent to-transparent" />
+              <span className="relative text-[11px] font-medium text-slate-100 z-10 truncate pr-4">
+                {wp.name}
+              </span>
+              <button
+                onClick={(e) => deleteCustom(wp.id, e)}
+                className="absolute top-2 left-2 bg-red-500/80 hover:bg-red-500 rounded-lg p-1 opacity-0 group-hover:opacity-100 transition-opacity z-20"
+              >
+                <Trash2 className="w-3 h-3 text-white" />
+              </button>
+              {isActive && (
+                <div className="absolute top-2 right-2 bg-amber-500 rounded-full p-0.5 z-10">
+                  <Check className="w-3 h-3 text-slate-950 stroke-[3]" />
                 </div>
               )}
             </div>
-          ))}
-        </div>
+          );
+        })}
 
-        {/* Big Glowy bottom action button triggering the quiz */}
-        <div className="pt-8 border-t border-slate-800/60 flex flex-col items-center justify-center space-y-3 text-center">
-          <div className="space-y-1">
-            <h3 className="text-sm font-bold text-slate-200">Mavzuni to'liq o'qib bo'ldingizmi?</h3>
-            <p className="text-xs text-slate-500">Endi AI sizni sinab ko'rish uchun maxsus savollar tayyorladi!</p>
-          </div>
-          
-          <button
-            onClick={onStartQuiz}
-            className="w-full sm:w-auto bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-extrabold text-xs sm:text-sm px-8 py-4 rounded-2xl transition-all shadow-xl shadow-amber-500/10 hover:shadow-amber-500/20 active:scale-95 flex items-center justify-center gap-2 group"
-          >
-            Mavzu Yuzasidan Bilimni Sinash (Quiz boshlash)
-            <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-1" />
-          </button>
-        </div>
-
+        {/* Custom Upload Button */}
+        <label className="relative h-20 rounded-xl border border-dashed border-slate-800 hover:border-slate-700 hover:bg-slate-900/30 transition-all flex flex-col items-center justify-center p-2 cursor-pointer group text-slate-400 hover:text-slate-200">
+          <input type="file" accept="image/*,video/*" onChange={handleFileUpload} className="hidden" />
+          <Upload className="w-5 h-5 mb-1 text-slate-400 group-hover:text-amber-400 transition-colors" />
+          <span className="text-[10px] font-medium">Yangi yuklash</span>
+        </label>
       </div>
-
     </div>
   );
 }

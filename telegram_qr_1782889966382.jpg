@@ -1,509 +1,550 @@
 import React, { useState, useEffect } from "react";
-import { User as UserIcon, Lock, ShieldAlert, ArrowRight, Eye, EyeOff, UserPlus, Shield, Sparkles } from "lucide-react";
-import { User } from "../types";
+import { 
+  Award, HelpCircle, CheckCircle2, XCircle, ArrowRight, ArrowLeft, RotateCcw, 
+  Sparkles, RefreshCw, Volume2, VolumeX, HelpCircle as HelpIcon, Play, Headphones, AlertTriangle
+} from "lucide-react";
+import { QuizQuestion, User } from "../types";
+import { speakText as speakTtsText, stopTts } from "../lib/tts";
 
-interface AuthSystemProps {
-  onLoginSuccess: (user: User) => void;
-  onAdminLoginSuccess?: () => void;
+interface SmartQuizViewProps {
+  questions: QuizQuestion[];
+  documentTitle: string;
+  user: User;
+  onRestart: () => void;
+  onUpdateUser: (updatedUser: User) => void;
 }
 
-export default function AuthSystem({ onLoginSuccess }: AuthSystemProps) {
-  const [activeTab, setActiveTab] = useState<"login" | "register" | "admin">("login");
-  
-  // Standard User form states
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [name, setName] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  
-  // Admin-only login states
-  const [adminPassword, setAdminPassword] = useState("");
-  const [showAdminPassword, setShowAdminPassword] = useState(false);
-  
-  // General UI states
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
-  const [isShaking, setIsShaking] = useState(false);
+interface EvaluationResult {
+  isCorrect: boolean;
+  scorePercent: number;
+  feedback: string;
+  explanation: string;
+  followUp?: {
+    question: string;
+    type: "multiple-choice" | "true-false";
+    options: string[];
+    correctAnswer: string;
+  };
+}
 
-  // Client fingerprint logic to prevent duplicate registration spam (maximum 3 creations per device)
-  const [clientFingerprint, setClientFingerprint] = useState("");
-  const [creationCount, setCreationCount] = useState(0);
+export default function SmartQuizView({ questions, documentTitle, user, onRestart, onUpdateUser }: SmartQuizViewProps) {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const activeQuestion = questions[currentIndex];
+
+  // User input states
+  const [answers, setAnswers] = useState<{ [id: string]: string }>({});
+  const [typedAnswer, setTypedAnswer] = useState("");
+  
+  // Evaluation States (AI Teacher Mode)
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evaluations, setEvaluations] = useState<{ [id: string]: EvaluationResult }>({});
+  const [isTTSActive, setIsTTSActive] = useState(false);
+  const [speechSpeed, setSpeechSpeed] = useState<number>(() => {
+    const saved = localStorage.getItem("tts_speed");
+    return saved ? parseFloat(saved) : 1.0;
+  });
+
+  const handleCycleSpeed = () => {
+    const speeds = [1.0, 1.25, 1.5, 1.75, 2.0];
+    const currentIndex = speeds.indexOf(speechSpeed);
+    const nextIndex = (currentIndex + 1) % speeds.length;
+    const nextSpeed = speeds[nextIndex];
+    setSpeechSpeed(nextSpeed);
+    localStorage.setItem("tts_speed", nextSpeed.toString());
+    logTelemetryAction("Change voice speed", `Ovoz tezligini "${nextSpeed}x" qilib o'zgartirdi.`);
+  };
+
+  // Adaptive follow-up states
+  const [followUpAnswer, setFollowUpAnswer] = useState("");
+  const [followUpResult, setFollowUpResult] = useState<{ isCorrect: boolean; feedback: string } | null>(null);
+
+  // Overall quiz completion states
+  const [isCompleted, setIsCompleted] = useState(false);
+  const [score, setScore] = useState(0);
 
   useEffect(() => {
-    // Retrieve or initialize unique client fingerprint
-    let fp = localStorage.getItem("user_client_fingerprint");
-    if (!fp) {
-      fp = "fp_" + Math.random().toString(36).substring(2, 11) + "_" + Date.now();
-      localStorage.setItem("user_client_fingerprint", fp);
-    }
-    setClientFingerprint(fp);
-
-    // Get current local creation count
-    const count = parseInt(localStorage.getItem("created_accounts_count") || "0", 10);
-    setCreationCount(count);
-  }, []);
-
-  const triggerShake = () => {
-    setIsShaking(true);
-    setTimeout(() => setIsShaking(false), 500);
-  };
-
-  const getDeviceInfo = () => {
-    const userAgent = navigator.userAgent;
-    return {
-      browser: userAgent.includes("Chrome") ? "Chrome" : userAgent.includes("Safari") ? "Safari" : userAgent.includes("Firefox") ? "Firefox" : "Browser",
-      os: navigator.platform,
-      deviceType: window.innerWidth < 768 ? "Mobile" : "Desktop"
+    // Scroll to top
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    setFollowUpAnswer("");
+    setFollowUpResult(null);
+    return () => {
+      stopTts();
     };
-  };
+  }, [currentIndex]);
 
-  // 1. Standard User Login Handler
-  const handleUserLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!username.trim() || !password) {
-      setError("Iltimos, foydalanuvchi nomi va parolni to'liq kiriting.");
-      triggerShake();
-      return;
-    }
-
-    setError("");
-    setSuccessMsg("");
-    setIsLoading(true);
-
+  const logTelemetryAction = async (action: string, details: string) => {
     try {
-      const response = await fetch("/api/auth/login", {
+      await fetch("/api/telemetry/action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: username.trim(),
-          password,
-          deviceInfo: getDeviceInfo()
+          userId: user.id,
+          userName: user.name,
+          action,
+          details,
+          deviceInfo: {
+            browser: "Chrome",
+            os: navigator.platform,
+            deviceType: window.innerWidth < 768 ? "Mobile" : "Desktop"
+          }
         })
       });
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
+  const submitUserAnswer = async (userAnswer: string) => {
+    if (!userAnswer || isEvaluating) return;
+
+    setIsEvaluating(true);
+
+    try {
+      const response = await fetch("/api/learning/evaluate-answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: activeQuestion,
+          userAnswer,
+          userId: user.id,
+          userName: user.name,
+          deviceInfo: {
+            browser: "Chrome",
+            os: navigator.platform,
+            deviceType: window.innerWidth < 768 ? "Mobile" : "Desktop"
+          }
+        })
+      });
       const data = await response.json();
 
-      if (response.ok && data.success) {
-        localStorage.setItem("current_user_session", JSON.stringify(data.user));
-        if (data.user.role === "admin") {
-          localStorage.setItem("is_admin_session", "true");
-        }
-        onLoginSuccess(data.user);
-      } else {
-        setError(data.error || "Foydalanuvchi nomi yoki parol noto'g'ri.");
-        triggerShake();
+      if (data.isBlocked) {
+        onUpdateUser({ ...user, status: "blocked", restrictionReason: data.reason });
+        return;
       }
-    } catch (err) {
-      setError("Tarmoq ulanishida yoki serverda xatolik yuz berdi.");
-      triggerShake();
+
+      if (response.ok) {
+        setEvaluations((prev) => ({ ...prev, [activeQuestion.id]: data }));
+        if (data.isCorrect) {
+          setScore((s) => s + 1);
+        }
+        // Speak AI Teacher's feedback automatically
+        speakText(data.feedback);
+      }
+    } catch (e) {
+      console.error(e);
     } finally {
-      setIsLoading(false);
+      setIsEvaluating(false);
     }
   };
 
-  // 2. Standard User Self-Registration Handler
-  const handleUserRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    // Double check local count protection
-    if (creationCount >= 3) {
-      setError("Ushbu qurilmadan ko'p hisob ochish taqiqlangan! Maksimal limit: 3 ta hisob.");
-      triggerShake();
-      return;
+  const handleSelectOption = async (option: string) => {
+    if (evaluations[activeQuestion.id] || isEvaluating) return; // already evaluated
+    setAnswers((prev) => ({ ...prev, [activeQuestion.id]: option }));
+    await submitUserAnswer(option);
+  };
+
+  const handleSubmitAnswer = async () => {
+    const userAnswer = activeQuestion.type === "short-answer" ? typedAnswer : answers[activeQuestion.id];
+    await submitUserAnswer(userAnswer);
+  };
+
+  const handleFollowUpSubmit = () => {
+    const evaluation = evaluations[activeQuestion.id];
+    if (!evaluation?.followUp) return;
+
+    const isCorrect = followUpAnswer.trim().toLowerCase() === evaluation.followUp.correctAnswer.trim().toLowerCase();
+    setFollowUpResult({
+      isCorrect,
+      feedback: isCorrect 
+        ? "Barakalla! Qo'shimcha savolga to'g'ri javob berdingiz, xatolikni tuzatdik!" 
+        : `Afsuski, to'g'ri javob: ${evaluation.followUp.correctAnswer}. AI o'qituvchingiz ko'proq mashq qilishni maslahat beradi.`
+    });
+
+    logTelemetryAction("Quiz answer (Adaptive)", isCorrect ? "Qo'shimcha savolga to'g'ri javob berdi" : "Qo'shimcha savolga xato javob berdi");
+  };
+
+  const speakText = (text: string) => {
+    speakTtsText(
+      text,
+      "female",
+      () => setIsTTSActive(true),
+      () => setIsTTSActive(false),
+      (err) => console.error(err)
+    );
+  };
+
+  const handleNext = () => {
+    if (currentIndex < questions.length - 1) {
+      setCurrentIndex(currentIndex + 1);
+      setTypedAnswer("");
+    } else {
+      setIsCompleted(true);
+      logTelemetryAction("Quiz finished", `"${documentTitle}" testi yakunlandi. Ball: ${score} / ${questions.length}`);
     }
+  };
 
-    if (!username.trim() || !password || !name.trim()) {
-      setError("Barcha maydonlarni to'ldirishingiz shart.");
-      triggerShake();
-      return;
+  const handlePrev = () => {
+    if (currentIndex > 0) {
+      setCurrentIndex(currentIndex - 1);
+      setTypedAnswer("");
     }
+  };
 
-    setError("");
-    setSuccessMsg("");
-    setIsLoading(true);
+  // Evaluation results for active question
+  const evaluation = evaluations[activeQuestion?.id];
 
-    try {
-      const response = await fetch("/api/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: username.trim(),
-          password,
-          name: name.trim(),
-          clientFingerprint,
-          deviceInfo: getDeviceInfo()
-        })
-      });
-
-      const data = await response.json();
-
-      if (response.ok && data.success) {
-        // Increment and save registration count
-        const nextCount = creationCount + 1;
-        setCreationCount(nextCount);
-        localStorage.setItem("created_accounts_count", String(nextCount));
-
-        // Directly log the user in for flawless instant entry!
-        localStorage.setItem("current_user_session", JSON.stringify(data.user));
-        if (data.user.role === "admin") {
-          localStorage.setItem("is_admin_session", "true");
-        }
+  if (isCompleted) {
+    const percentage = Math.round((score / questions.length) * 100);
+    return (
+      <div id="quiz-result-view" className="w-full max-w-xl mx-auto glass-panel-dark p-8 rounded-3xl border border-slate-800 text-center space-y-6 relative z-10 transition-all duration-300">
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-48 h-48 bg-amber-500/10 blur-3xl rounded-full pointer-events-none" />
         
-        setSuccessMsg("Hisobingiz muvaffaqiyatli yaratildi va kirildi!");
-        onLoginSuccess(data.user);
-      } else {
-        setError(data.error || "Hisob yaratishda xatolik yuz berdi.");
-        triggerShake();
-      }
-    } catch (err) {
-      setError("Tarmoq ulanishida xatolik yuz berdi.");
-      triggerShake();
-    } finally {
-      setIsLoading(false);
-    }
-  };
+        <div className="inline-flex p-4 bg-amber-500/10 rounded-2xl border border-amber-500/20 mb-2">
+          <Award className="w-12 h-12 text-amber-500" />
+        </div>
 
-  // 3. Admin-Only Password Login Handler
-  const handleAdminLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!adminPassword) {
-      setError("Administrator parolini kiriting.");
-      triggerShake();
-      return;
-    }
+        <div className="space-y-1">
+          <h2 className="text-xl font-bold text-white font-display">Siz testni muvaffaqiyatli topshirdingiz!</h2>
+          <p className="text-slate-400 text-xs">AI O'qituvchining dars baholash natijasi</p>
+        </div>
 
-    setError("");
-    setSuccessMsg("");
-    setIsLoading(true);
+        {/* Visual progress wheel */}
+        <div className="relative w-36 h-36 mx-auto flex items-center justify-center">
+          <svg className="w-full h-full transform -rotate-90">
+            <circle cx="72" cy="72" r="60" stroke="#1e293b" strokeWidth="10" fill="transparent" />
+            <circle 
+              cx="72" 
+              cy="72" 
+              r="60" 
+              stroke="#f59e0b" 
+              strokeWidth="10" 
+              fill="transparent" 
+              strokeDasharray={2 * Math.PI * 60}
+              strokeDashoffset={2 * Math.PI * 60 * (1 - score / questions.length)}
+              className="transition-all duration-1000 ease-out"
+            />
+          </svg>
+          <div className="absolute flex flex-col items-center">
+            <span className="text-3xl font-extrabold text-white">{percentage}%</span>
+            <span className="text-[10px] text-slate-400 font-bold">{score} / {questions.length} To'g'ri</span>
+          </div>
+        </div>
 
-    try {
-      const response = await fetch("/api/auth/admin-login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          password: adminPassword,
-          deviceInfo: getDeviceInfo()
-        })
-      });
+        <div className="p-4 bg-slate-950/40 border border-slate-900 rounded-2xl text-slate-300 text-xs leading-relaxed max-w-md mx-auto">
+          {percentage >= 80 
+            ? "Ajoyib natija! Siz mavzuni deyarli mukammal o'zlashtirdingiz. AI sizga yangi matn yuklab chuqurroq o'rganishni maslahat beradi." 
+            : "Natijangiz yomon emas, lekin mavzuni mukammal tushunish uchun bo'limlarni qayta o'qib, AI O'qituvchi tushuntirishlarini tinglashingiz foydali."
+          }
+        </div>
 
-      const data = await response.json();
-
-      if (response.ok && data.success) {
-        localStorage.setItem("current_user_session", JSON.stringify(data.user));
-        localStorage.setItem("is_admin_session", "true");
-        onLoginSuccess(data.user);
-      } else {
-        setError(data.error || "Xato administrator paroli! Kirish qat'iyan man etiladi.");
-        triggerShake();
-      }
-    } catch (err) {
-      setError("Administrator tizimiga ulanishda xatolik yuz berdi.");
-      triggerShake();
-    } finally {
-      setIsLoading(false);
-    }
-  };
+        <div className="flex items-center gap-3 max-w-sm mx-auto pt-2">
+          <button
+            onClick={onRestart}
+            className="flex-1 border border-slate-800 hover:border-slate-700 hover:bg-slate-900/30 text-slate-400 hover:text-white text-xs font-semibold py-3 rounded-xl transition-all flex items-center justify-center gap-2"
+          >
+            <RotateCcw className="w-4 h-4" />
+            Yangi Matn Yuklash
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div id="auth-container" className="w-full max-w-md mx-auto relative z-10">
-      <div className={`glass-panel-dark text-white rounded-3xl p-8 shadow-2xl border border-slate-800/80 relative overflow-hidden backdrop-blur-xl transition-all duration-500 ${isShaking ? "animate-shake border-red-500/50" : ""}`}>
-        
-        {/* Neon decorative background glow */}
-        <div className="absolute top-0 left-1/4 w-32 h-32 bg-amber-500/10 blur-3xl rounded-full pointer-events-none" />
-        <div className="absolute bottom-0 right-1/4 w-32 h-32 bg-amber-500/5 blur-3xl rounded-full pointer-events-none" />
+    <div id="quiz-question-container" className="w-full max-w-2xl mx-auto space-y-6 relative z-10 p-2 sm:p-4">
+      
+      {/* Quiz Progress header */}
+      <div className="flex items-center justify-between glass-panel-dark p-5 rounded-2xl border border-slate-800">
+        <div>
+          <span className="text-[10px] font-bold text-amber-500 uppercase tracking-widest">Bilimni mustahkamlash</span>
+          <h2 className="text-xs text-slate-400 truncate max-w-xs sm:max-w-md">{documentTitle}</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-bold text-slate-400">Savol:</span>
+          <span className="font-mono text-xs font-extrabold text-amber-400 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded-lg">
+            {currentIndex + 1} / {questions.length}
+          </span>
+        </div>
+      </div>
 
-        <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center p-3.5 bg-amber-500/10 rounded-2xl mb-3 border border-amber-500/20 shadow-lg shadow-amber-500/5">
-            {activeTab === "admin" ? (
-              <Shield className="w-7 h-7 text-amber-500 animate-pulse" />
+      {/* Main examiner card */}
+      <div className="glass-panel-dark p-6 rounded-3xl border border-slate-800 space-y-6 relative overflow-hidden">
+        
+        {/* Topic tag */}
+        <div className="flex items-center justify-between">
+          <span className="px-2.5 py-1 bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-full text-[10px] font-bold tracking-wide">
+            Bo'lim: {activeQuestion?.topic}
+          </span>
+          {evaluation && (
+            <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wide flex items-center gap-1 ${
+              evaluation.isCorrect ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"
+            }`}>
+              {evaluation.isCorrect ? "To'g'ri" : "Xato"}
+            </span>
+          )}
+        </div>
+
+        {/* Question Text */}
+        <h3 className="text-sm sm:text-base font-semibold text-slate-100 font-display leading-relaxed">
+          {activeQuestion?.question}
+        </h3>
+
+        {/* Answer Layouts based on question type */}
+        <div className="space-y-2.5">
+          {activeQuestion?.type === "multiple-choice" && activeQuestion.options && (
+            <div className="grid grid-cols-1 gap-2.5">
+              {activeQuestion.options.map((option, idx) => {
+                const isSelected = answers[activeQuestion.id] === option;
+                const isAnswered = !!evaluation;
+                const isCorrectOption = option === activeQuestion.correctAnswer;
+                
+                let btnStyle = "border-slate-800 hover:border-slate-700 hover:bg-slate-900/30 text-slate-300";
+                if (isSelected) btnStyle = "border-amber-500 bg-amber-500/10 text-amber-400 font-semibold";
+                if (isAnswered) {
+                  if (isCorrectOption) btnStyle = "border-emerald-500/60 bg-emerald-500/10 text-emerald-400 font-semibold";
+                  else if (isSelected) btnStyle = "border-red-500/60 bg-red-500/10 text-red-400";
+                  else btnStyle = "border-slate-900 text-slate-500 opacity-60";
+                }
+
+                return (
+                  <button
+                    key={idx}
+                    disabled={isAnswered}
+                    onClick={() => handleSelectOption(option)}
+                    className={`w-full py-3.5 px-4 rounded-xl border text-left text-xs transition-all flex items-center justify-between ${btnStyle}`}
+                  >
+                    <span>{option}</span>
+                    {isAnswered && isCorrectOption && <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0 ml-2" />}
+                    {isAnswered && isSelected && !isCorrectOption && <XCircle className="w-4 h-4 text-red-500 flex-shrink-0 ml-2" />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {activeQuestion?.type === "true-false" && (
+            <div className="grid grid-cols-1 gap-3">
+              {["True", "False"].map((option) => {
+                const isSelected = answers[activeQuestion.id] === option;
+                const isAnswered = !!evaluation;
+                const isCorrectOption = option === activeQuestion.correctAnswer;
+
+                let btnStyle = "border-slate-800 hover:border-slate-700 hover:bg-slate-900/30 text-slate-300";
+                if (isSelected) btnStyle = "border-amber-500 bg-amber-500/10 text-amber-400 font-semibold";
+                if (isAnswered) {
+                  if (isCorrectOption) btnStyle = "border-emerald-500/60 bg-emerald-500/10 text-emerald-400 font-semibold";
+                  else if (isSelected) btnStyle = "border-red-500/60 bg-red-500/10 text-red-400";
+                  else btnStyle = "border-slate-900 text-slate-500 opacity-60";
+                }
+
+                return (
+                  <button
+                    key={option}
+                    disabled={isAnswered}
+                    onClick={() => handleSelectOption(option)}
+                    className={`py-4 rounded-xl border text-center font-bold text-xs transition-all ${btnStyle}`}
+                  >
+                    {option === "True" ? "To'g'ri (True)" : "Noto'g'ri (False)"}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {activeQuestion?.type === "short-answer" && (
+            <div className="space-y-2">
+              <input
+                type="text"
+                disabled={!!evaluation}
+                placeholder="Javobingizni qisqa kalit so'z bilan kiriting..."
+                value={typedAnswer}
+                onChange={(e) => setTypedAnswer(e.target.value)}
+                className="w-full bg-slate-950/60 border border-slate-800 rounded-xl py-3 px-4 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 transition-all"
+              />
+              {evaluation && (
+                <div className="p-3 bg-slate-900/50 rounded-xl border border-slate-800 flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400">To'g'ri javob:</span>
+                  <span className="text-xs font-bold text-emerald-400">{activeQuestion.correctAnswer}</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Submit answer CTA */}
+        {!evaluation && (
+          <button
+            onClick={handleSubmitAnswer}
+            disabled={isEvaluating || (activeQuestion.type === "short-answer" ? !typedAnswer : !answers[activeQuestion.id])}
+            className="w-full bg-amber-500 hover:bg-amber-400 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-slate-950 text-xs font-bold py-3 px-4 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 mt-4"
+          >
+            {isEvaluating ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                AI O'qituvchi baholamoqda...
+              </>
             ) : (
-              <Sparkles className="w-7 h-7 text-amber-500" />
+              <>
+                Javobni Tasdiqlash
+                <ArrowRight className="w-4 h-4" />
+              </>
+            )}
+          </button>
+        )}
+
+        {/* AI TEACHER EVALUATION FEEDBACK BLOCK */}
+        {evaluation && (
+          <div className="space-y-4 pt-4 border-t border-slate-800/80 animate-fade-in">
+            
+            {/* Feedback header */}
+            <div className={`p-4 rounded-2xl border flex flex-col gap-2 relative overflow-hidden ${
+              evaluation.isCorrect ? "bg-emerald-500/5 border-emerald-500/10" : "bg-red-500/5 border-red-500/10"
+            }`}>
+              <div className="absolute top-0 right-0 p-3 text-emerald-500/10">
+                <Sparkles className="w-8 h-8" />
+              </div>
+              <div className="flex items-center gap-2">
+                <HelpIcon className={`w-4 h-4 ${evaluation.isCorrect ? "text-emerald-400" : "text-red-400"}`} />
+                <span className={`text-[10px] font-bold uppercase tracking-wider ${evaluation.isCorrect ? "text-emerald-400" : "text-red-400"}`}>
+                  AI O'qituvchi fikri (Feedback)
+                </span>
+              </div>
+              <p className="text-slate-300 text-xs font-semibold leading-relaxed">{evaluation.feedback}</p>
+              <p className="text-slate-400 text-[11px] leading-relaxed font-normal">{evaluation.explanation}</p>
+              
+              <div className="flex items-center gap-2 mt-2">
+                <button
+                  onClick={() => {
+                    if (isTTSActive) {
+                      stopTts();
+                      setIsTTSActive(false);
+                    } else {
+                      speakText(evaluation.feedback + ". " + evaluation.explanation);
+                    }
+                  }}
+                  className={`inline-flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1.5 rounded-lg border transition-all ${
+                    isTTSActive 
+                      ? "bg-red-500/15 text-red-400 border-red-500/30 animate-pulse" 
+                      : "text-amber-500 hover:text-amber-400 bg-slate-950 border-slate-800"
+                  }`}
+                >
+                  {isTTSActive ? (
+                    <>
+                      <VolumeX className="w-3.5 h-3.5" />
+                      Ovozni O'chirish
+                    </>
+                  ) : (
+                    <>
+                      <Volume2 className="w-3.5 h-3.5" />
+                      Fikrni Eshitish
+                    </>
+                  )}
+                </button>
+
+                {/* Speed selector button with downward-pointing triangle */}
+                <button
+                  onClick={handleCycleSpeed}
+                  title="Gapirish tezligini oshirish"
+                  className="inline-flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1.5 rounded-lg border border-slate-800 hover:border-slate-700 bg-slate-950 text-amber-500 transition-all hover:text-amber-400"
+                >
+                  <svg className="w-2.5 h-2.5 fill-current text-amber-500" viewBox="0 0 24 24">
+                    <path d="M21 6H3L12 18L21 6Z" />
+                  </svg>
+                  <span className="font-mono">{speechSpeed.toFixed(2)}x</span>
+                </button>
+              </div>
+            </div>
+
+            {/* ADAPTIVE CHAT / FOLLOW UP SYSTEM */}
+            {!evaluation.isCorrect && evaluation.followUp && (
+              <div className="p-4 bg-amber-500/5 border border-amber-500/15 rounded-2xl space-y-3.5 relative">
+                <div className="flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-500" />
+                  <span className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">
+                    Moslashtirilgan sinov (Adaptive Follow-up)
+                  </span>
+                </div>
+                
+                <p className="text-slate-200 text-xs font-semibold">{evaluation.followUp.question}</p>
+
+                {evaluation.followUp.type === "true-false" ? (
+                  <div className="grid grid-cols-2 gap-2">
+                    {["True", "False"].map((opt) => (
+                      <button
+                        key={opt}
+                        disabled={!!followUpResult}
+                        onClick={() => setFollowUpAnswer(opt)}
+                        className={`py-2 px-3 rounded-lg border text-xs font-semibold transition-all ${
+                          followUpAnswer === opt 
+                            ? "bg-amber-500/10 text-amber-400 border-amber-500/30" 
+                            : "border-slate-800 text-slate-400 hover:text-slate-300"
+                        }`}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {evaluation.followUp.options.map((opt, idx) => (
+                      <button
+                        key={idx}
+                        disabled={!!followUpResult}
+                        onClick={() => setFollowUpAnswer(opt)}
+                        className={`w-full py-2.5 px-3 rounded-lg border text-left text-xs transition-all ${
+                          followUpAnswer === opt 
+                            ? "bg-amber-500/10 text-amber-400 border-amber-500/30" 
+                            : "border-slate-800 text-slate-400 hover:text-slate-300"
+                        }`}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {!followUpResult ? (
+                  <button
+                    onClick={handleFollowUpSubmit}
+                    disabled={!followUpAnswer}
+                    className="w-full bg-slate-950 border border-slate-800 text-amber-400 text-[10px] font-bold py-2 px-3 rounded-xl hover:border-amber-500/30 transition-all flex items-center justify-center gap-1.5"
+                  >
+                    Qo'shimcha javobni tekshirish
+                  </button>
+                ) : (
+                  <div className={`p-3 rounded-xl border text-[11px] font-semibold flex items-center gap-1.5 ${
+                    followUpResult.isCorrect ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" : "bg-red-500/10 text-red-400 border-red-500/20"
+                  }`}>
+                    {followUpResult.isCorrect ? <CheckCircle2 className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
+                    {followUpResult.feedback}
+                  </div>
+                )}
+              </div>
             )}
           </div>
-          <h1 className="text-2xl font-extrabold text-white tracking-tight">
-            {activeTab === "admin" ? "Admin Tizimi" : "Kognitiv Ta'lim Tizimi"}
-          </h1>
-          <p className="text-slate-400 text-xs mt-1.5 max-w-xs mx-auto">
-            {activeTab === "admin" 
-              ? "Tizim ma'lumotlarini boshqarish va foydalanuvchilar nazorati."
-              : "Mavzularni oddiy va oson tushunish, testlar yordamida o'zlashtirish platformasi."}
-          </p>
-        </div>
+        )}
 
-        {/* Tab Switcher */}
-        <div className="flex bg-slate-950/80 p-1 rounded-2xl border border-slate-900 mb-5 gap-1">
+        {/* Unified Pagination / navigation footer (Always visible so they can skip/go back if they don't understand) */}
+        <div className="flex items-center justify-between border-t border-slate-800/80 pt-4 mt-6">
           <button
-            type="button"
-            onClick={() => {
-              setActiveTab("login");
-              setError("");
-              setSuccessMsg("");
-            }}
-            className={`flex-1 py-2 text-[11px] font-bold rounded-xl transition-all ${
-              activeTab === "login" 
-                ? "bg-amber-500 text-slate-950 shadow-md shadow-amber-500/10" 
-                : "text-slate-400 hover:text-slate-200"
-            }`}
+            onClick={handlePrev}
+            disabled={currentIndex === 0}
+            className="px-4 py-2.5 rounded-xl border border-slate-800 hover:border-slate-700 hover:bg-slate-900/30 text-slate-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all text-xs font-semibold flex items-center gap-1.5"
           >
-            Kirish
+            <ArrowLeft className="w-4 h-4" />
+            Orqaga qaytish
           </button>
           <button
-            type="button"
-            onClick={() => {
-              setActiveTab("register");
-              setError("");
-              setSuccessMsg("");
-            }}
-            className={`flex-1 py-2 text-[11px] font-bold rounded-xl transition-all ${
-              activeTab === "register" 
-                ? "bg-amber-500 text-slate-950 shadow-md shadow-amber-500/10" 
-                : "text-slate-400 hover:text-slate-200"
+            onClick={handleNext}
+            className={`font-extrabold text-xs px-5 py-2.5 rounded-xl transition-all shadow-lg flex items-center gap-1.5 ${
+              evaluation 
+                ? "bg-amber-500 hover:bg-amber-400 text-slate-950" 
+                : "bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300"
             }`}
           >
-            Ro'yxatdan o'tish
+            {currentIndex === questions.length - 1 ? "Natijalarni ko'rish" : "Keyingi savol"}
+            <ArrowRight className="w-4 h-4" />
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab("admin");
-              setError("");
-              setSuccessMsg("");
-            }}
-            className={`flex-1 py-2 text-[11px] font-bold rounded-xl transition-all flex items-center justify-center gap-1 ${
-              activeTab === "admin" 
-                ? "bg-amber-500 text-slate-950 shadow-md shadow-amber-500/10" 
-                : "text-slate-400 hover:text-slate-200"
-            }`}
-          >
-            <Shield className="w-3.5 h-3.5" />
-            Admin
-          </button>
-        </div>
-
-        {/* Action Error message banner */}
-        {error && (
-          <div className="mb-4 p-3.5 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-2.5 animate-fadeIn">
-            <ShieldAlert className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-            <p className="text-red-400 text-xs leading-relaxed font-semibold">{error}</p>
-          </div>
-        )}
-
-        {/* Success message banner */}
-        {successMsg && (
-          <div className="mb-4 p-3.5 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-start gap-2.5 animate-fadeIn">
-            <div className="w-4 h-4 rounded-full bg-emerald-500/20 flex items-center justify-center shrink-0 mt-0.5">
-              <span className="text-emerald-400 text-[10px] font-black">✓</span>
-            </div>
-            <p className="text-emerald-400 text-xs leading-relaxed font-semibold">{successMsg}</p>
-          </div>
-        )}
-
-        {/* Tab 1: Login Form */}
-        {activeTab === "login" && (
-          <form onSubmit={handleUserLogin} className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Foydalanuvchi nomi</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <UserIcon className="w-4 h-4" />
-                </span>
-                <input
-                  type="text"
-                  required
-                  disabled={isLoading}
-                  placeholder="Login nomingizni kiriting"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 rounded-xl py-3 pl-10 pr-4 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Tizim paroli</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <Lock className="w-4 h-4" />
-                </span>
-                <input
-                  type={showPassword ? "text" : "password"}
-                  required
-                  disabled={isLoading}
-                  placeholder="Maxfiy parolingizni kiriting"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 rounded-xl py-3 pl-10 pr-10 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-500 hover:text-slate-300 transition-colors"
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isLoading}
-              className="w-full mt-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs py-3.5 rounded-xl transition-all shadow-lg shadow-amber-500/10 flex items-center justify-center gap-2 hover:translate-y-[-1px] active:translate-y-[1px] disabled:opacity-50"
-            >
-              {isLoading ? (
-                <span className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-              ) : (
-                <>
-                  Tizimga kirish
-                  <ArrowRight className="w-4 h-4" />
-                </>
-              )}
-            </button>
-          </form>
-        )}
-
-        {/* Tab 2: Self-Registration Form */}
-        {activeTab === "register" && (
-          <form onSubmit={handleUserRegister} className="space-y-4">
-            <div className="bg-slate-950/50 p-3 rounded-xl border border-slate-900 mb-2 flex items-center justify-between">
-              <span className="text-[11px] text-slate-400 font-medium">Yaratilgan hisoblar limit:</span>
-              <span className="text-xs font-bold text-amber-500">{creationCount} / 3</span>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Ism / Familiya</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <UserIcon className="w-4 h-4" />
-                </span>
-                <input
-                  type="text"
-                  required
-                  disabled={isLoading || creationCount >= 3}
-                  placeholder="Ismingizni kiriting"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 rounded-xl py-3 pl-10 pr-4 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Tanlang: Foydalanuvchi nomi (Login)</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <UserIcon className="w-4 h-4" />
-                </span>
-                <input
-                  type="text"
-                  required
-                  disabled={isLoading || creationCount >= 3}
-                  placeholder="Masalan: umid_student"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 rounded-xl py-3 pl-10 pr-4 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Yangi parol yarating</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <Lock className="w-4 h-4" />
-                </span>
-                <input
-                  type={showPassword ? "text" : "password"}
-                  required
-                  disabled={isLoading || creationCount >= 3}
-                  placeholder="Yangi maxfiy parolingizni kiriting"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 rounded-xl py-3 pl-10 pr-10 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-500 hover:text-slate-300 transition-colors"
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isLoading || creationCount >= 3}
-              className="w-full mt-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs py-3.5 rounded-xl transition-all shadow-lg shadow-amber-500/10 flex items-center justify-center gap-2 hover:translate-y-[-1px] active:translate-y-[1px] disabled:opacity-50"
-            >
-              {isLoading ? (
-                <span className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-              ) : (
-                <>
-                  Hisob yaratish
-                  <UserPlus className="w-4 h-4" />
-                </>
-              )}
-            </button>
-          </form>
-        )}
-
-        {/* Tab 3: Dedicated Admin Login Form */}
-        {activeTab === "admin" && (
-          <form onSubmit={handleAdminLogin} className="space-y-4">
-            <div className="p-3.5 bg-amber-500/5 border border-amber-500/10 rounded-2xl flex items-center gap-2.5">
-              <Shield className="w-5 h-5 text-amber-500 shrink-0" />
-              <p className="text-amber-300 text-[11px] leading-relaxed">
-                Tizim administratori uchun maxsus himoyalangan portal. Davom etish uchun maxfiy parolni kiriting.
-              </p>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Admin Paroli</label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
-                  <Lock className="w-4 h-4 text-amber-500/40" />
-                </span>
-                <input
-                  type={showAdminPassword ? "text" : "password"}
-                  required
-                  disabled={isLoading}
-                  placeholder="Administrator parolini kiriting"
-                  value={adminPassword}
-                  onChange={(e) => setAdminPassword(e.target.value)}
-                  className="w-full bg-slate-950/60 border border-slate-800/80 focus:border-amber-500 rounded-xl py-3 pl-10 pr-10 text-xs text-white placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500/20 transition-all disabled:opacity-50"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowAdminPassword(!showAdminPassword)}
-                  className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-500 hover:text-slate-300 transition-colors"
-                >
-                  {showAdminPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isLoading}
-              className="w-full mt-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-slate-950 font-bold text-xs py-3.5 rounded-xl transition-all shadow-lg shadow-amber-500/15 flex items-center justify-center gap-2 hover:translate-y-[-1px] active:translate-y-[1px] disabled:opacity-50"
-            >
-              {isLoading ? (
-                <span className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-              ) : (
-                <>
-                  Tizimni Boshqarish (Admin)
-                  <Shield className="w-4 h-4" />
-                </>
-              )}
-            </button>
-          </form>
-        )}
-
-        <div className="mt-8 text-center border-t border-slate-850 pt-5">
-          <p className="text-[10px] text-slate-500 font-mono uppercase tracking-wider">
-            Platform Secure Engine v3.0 • SSL Protected
-          </p>
         </div>
 
       </div>
