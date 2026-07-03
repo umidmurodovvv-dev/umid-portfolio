@@ -1,0 +1,1348 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+import crypto from "crypto";
+import fs from "fs";
+import dns from "dns";
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+
+// Lazy-loaded Gemini Client
+let aiClient: GoogleGenAI | null = null;
+function getGemini(): GoogleGenAI {
+  if (!aiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY environment variable is not defined.");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+  }
+  return aiClient;
+}
+
+// -------------------------------------------------------------
+// SECURE USERNAME + PASSWORD PERSISTENCE ENGINE
+// -------------------------------------------------------------
+
+interface User {
+  id: string;
+  username: string;
+  password_hash?: string; // Stored securely on server, omitted on client response
+  name: string; // Full Name (optional, defaults to username)
+  notes?: string; // Optional admin notes
+  role: "user" | "admin";
+  status: "active" | "blocked" | "restricted";
+  restrictionReason?: string;
+  isOnline: boolean;
+  lastActive: string;
+  createdAt: string;
+  updatedAt: string;
+  lastLogin?: string;
+  createdBy?: string;
+  created_at: string;
+  updated_at: string;
+  last_login?: string | null;
+  created_by?: string | null;
+  deviceInfo: {
+    browser: string;
+    os: string;
+    deviceType: string;
+    loginTime: string;
+  };
+}
+
+interface ActivityLog {
+  id: string;
+  userId: string;
+  userName: string;
+  action: string;
+  details: string;
+  timestamp: string;
+  device: string;
+  browser: string;
+  os: string;
+}
+
+interface AdminReviewFlag {
+  id: string;
+  userId: string;
+  userName: string;
+  action: string;
+  reason: string;
+  timestamp: string;
+  status: "pending" | "resolved_cleared" | "resolved_blocked" | "resolved_restricted";
+  details: string;
+}
+
+// Global state arrays (now backed by users_db.json)
+let users: User[] = [];
+let activities: ActivityLog[] = [];
+let flags: AdminReviewFlag[] = [];
+
+let totalExplanationsCount = 0;
+let totalQuestionsAnsweredCount = 0;
+let correctAnswersCount = 0;
+let incorrectAnswersCount = 0;
+
+// Database File Path
+const DB_PATH = path.join(process.cwd(), "users_db.json");
+
+// Password hashing helper using secure PBKDF2 with salt
+function hashPassword(password: string): string {
+  const salt = "ultimate_learning_salt_998";
+  return crypto.pbkdf2Sync(password, salt, 1000, 64, "sha512").toString("hex");
+}
+
+// Load DB from file
+function loadDB(): { users: User[]; activities: ActivityLog[]; flags: AdminReviewFlag[] } {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const content = fs.readFileSync(DB_PATH, "utf-8");
+      return JSON.parse(content);
+    }
+  } catch (err) {
+    console.error("Database read failed, using empty defaults:", err);
+  }
+  return { users: [], activities: [], flags: [] };
+}
+
+// Save DB to file
+function saveDB(store: { users: User[]; activities: ActivityLog[]; flags: AdminReviewFlag[] }) {
+  try {
+    fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Database write failed:", err);
+  }
+}
+
+// Secure brute-force rate limiter
+const loginAttempts = new Map<string, { attempts: number; lockUntil: number }>();
+
+function isRateLimited(username: string): boolean {
+  const record = loginAttempts.get(username);
+  if (!record) return false;
+  if (record.lockUntil > Date.now()) return true;
+  return false;
+}
+
+function registerLoginAttempt(username: string, success: boolean) {
+  const record = loginAttempts.get(username) || { attempts: 0, lockUntil: 0 };
+  if (success) {
+    loginAttempts.delete(username);
+  } else {
+    record.attempts += 1;
+    if (record.attempts >= 5) {
+      record.lockUntil = Date.now() + 60 * 1000; // 1-minute lock
+      record.attempts = 0;
+    }
+    loginAttempts.set(username, record);
+  }
+}
+
+let currentAdminPassword = "umidali_2010";
+
+// Initialize and seed database with secure administrator credentials
+function initializeDB() {
+  const store = loadDB() as any;
+  let changed = false;
+
+  if (!store.adminPassword) {
+    store.adminPassword = "umidali_2010";
+    changed = true;
+  }
+  currentAdminPassword = store.adminPassword;
+
+  const adminPasswordHash = hashPassword(currentAdminPassword);
+
+  const adminExists = store.users.some((u: any) => u.username === "admin" && u.role === "admin");
+  if (!adminExists) {
+    // Purge any conflicting user 'admin'
+    store.users = store.users.filter((u: any) => u.username !== "admin");
+
+    const adminUser: User = {
+      id: "admin_user_id",
+      username: "admin",
+      password_hash: adminPasswordHash,
+      name: "Administrator",
+      notes: "Tizim Boshqaruvchisi",
+      role: "admin",
+      status: "active",
+      isOnline: false,
+      lastActive: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      lastLogin: null,
+      createdBy: "system",
+      deviceInfo: {
+        browser: "N/A",
+        os: "N/A",
+        deviceType: "Server",
+        loginTime: new Date().toISOString()
+      }
+    };
+    store.users.unshift(adminUser);
+    changed = true;
+    console.log("[DB ENGINE] Seeded administrator account successfully.");
+  } else {
+    // If admin exists, ensure their password is in sync
+    const admin = store.users.find((u: any) => u.username === "admin" && u.role === "admin");
+    if (admin) {
+      let adminChanged = false;
+      if (admin.password_hash !== adminPasswordHash) {
+        admin.password_hash = adminPasswordHash;
+        adminChanged = true;
+      }
+      if (admin.status !== "active") {
+        admin.status = "active";
+        admin.restrictionReason = undefined;
+        adminChanged = true;
+      }
+      if (adminChanged) {
+        admin.updatedAt = new Date().toISOString();
+        admin.updated_at = new Date().toISOString();
+        changed = true;
+        console.log("[DB ENGINE] Updated administrator password and/or status to match active state.");
+      }
+    }
+  }
+
+  if (changed || store.users.length === 1) {
+    saveDB(store);
+  }
+
+  users = store.users;
+  activities = store.activities || [];
+  flags = store.flags || [];
+}
+
+// Run DB bootstrap
+initializeDB();
+
+
+// Real-Time SSE clients
+let sseClients: any[] = [];
+
+function broadcastToAdmins(event: string, data: any) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(client => client.write(payload));
+}
+
+// System logging helper
+function logUserActivity(userId: string, userName: string, action: string, details: string, deviceData: any) {
+  const newLog: ActivityLog = {
+    id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+    userId,
+    userName,
+    action,
+    details,
+    timestamp: new Date().toISOString(),
+    device: deviceData?.deviceType || "Desktop",
+    browser: deviceData?.browser || "Chrome",
+    os: deviceData?.os || "Windows 10"
+  };
+  activities.unshift(newLog);
+  if (activities.length > 100) activities.pop();
+
+  // Update online status
+  const user = users.find(u => u.id === userId);
+  if (user) {
+    user.isOnline = true;
+    user.lastActive = new Date().toISOString();
+  }
+
+  // Update statistics dynamically
+  if (action.includes("explanation") || action.includes("Explain")) {
+    totalExplanationsCount++;
+  } else if (action.toLowerCase().includes("quiz answer") || action.toLowerCase().includes("evaluate")) {
+    totalQuestionsAnsweredCount++;
+  }
+
+  // Persist to DB file
+  saveDB({ users, activities, flags });
+
+  // Broadcast
+  broadcastToAdmins("stateUpdate", {
+    users,
+    activities,
+    flags,
+    stats: getStats()
+  });
+}
+
+function getStats() {
+  const online = users.filter(u => u.isOnline).length;
+  const offline = users.filter(u => !u.isOnline).length;
+  const uniqueUploads = activities.filter(a => a.action === "Upload text").length;
+
+  return {
+    onlineUsers: online,
+    offlineUsers: offline,
+    activeSessions: online,
+    uploadedTexts: uniqueUploads,
+    aiExplanationsCount: totalExplanationsCount,
+    quizSessions: Math.ceil(totalQuestionsAnsweredCount / 5),
+    totalQuestionsAnswered: totalQuestionsAnsweredCount,
+    correctAnswersCount: correctAnswersCount,
+    incorrectAnswersCount: incorrectAnswersCount,
+    averageLearningTime: online > 0 ? 12.5 : 0
+  };
+}
+
+// Email & SMS verification gateways removed as we transitioned completely to a secure Username + Password model.
+
+
+// -------------------------------------------------------------
+// ENDPOINTS
+// -------------------------------------------------------------
+
+// Real-Time SSE channel
+app.get("/api/telemetry/stream", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive"
+  });
+  res.write("retry: 10000\n\n");
+  
+  sseClients.push(res);
+  
+  // Send initial data snapshot
+  res.write(`event: init\ndata: ${JSON.stringify({ users, activities, flags, stats: getStats() })}\n\n`);
+
+  req.on("close", () => {
+    sseClients = sseClients.filter(client => client !== res);
+  });
+});
+
+// Record user activity manually
+app.post("/api/telemetry/action", (req, res) => {
+  const { userId, userName, action, details, deviceInfo } = req.body;
+  if (!userId || !userName) {
+    return res.status(400).json({ error: "userId and userName are required" });
+  }
+  logUserActivity(userId, userName, action, details, deviceInfo);
+  res.json({ success: true });
+});
+
+// Live DNS checking endpoint for ultimate.ai.uz custom domain mapping
+app.get("/api/domain/check", async (req, res) => {
+  const domain = "ultimate.ai.uz";
+  const wwwDomain = "www.ultimate.ai.uz";
+  
+  const result: any = {
+    domain,
+    wwwDomain,
+    configured: false,
+    aRecords: [],
+    cnameRecords: [],
+    error: null,
+    checkedAt: new Date().toISOString()
+  };
+
+  try {
+    // Resolve A records for apex domain using native dns lookup with timeout
+    const aRecords = await new Promise<string[]>((resolve) => {
+      const timer = setTimeout(() => resolve([]), 3000);
+      dns.resolve4(domain, (err, addresses) => {
+        clearTimeout(timer);
+        if (err) resolve([]);
+        else resolve(addresses || []);
+      });
+    });
+    result.aRecords = aRecords;
+
+    // Resolve CNAME records for www subdomain
+    const cnameRecords = await new Promise<string[]>((resolve) => {
+      const timer = setTimeout(() => resolve([]), 3000);
+      dns.resolveCname(wwwDomain, (err, addresses) => {
+        clearTimeout(timer);
+        if (err) resolve([]);
+        else resolve(addresses || []);
+      });
+    });
+    result.cnameRecords = cnameRecords;
+
+    // Check if configured correctly pointing to standard Google Custom Domain IPs or Google CNAME
+    const googleIps = ["216.239.32.21", "216.239.34.21", "216.239.36.21", "216.239.38.21"];
+    const hasGoogleIp = aRecords.some(ip => googleIps.includes(ip));
+    const hasGoogleCname = cnameRecords.some(cname => cname.toLowerCase().includes("googlehosted.com") || cname.toLowerCase().includes("google.com"));
+
+    // If addresses are present, we consider it connected in some capacity
+    if (hasGoogleIp || hasGoogleCname || aRecords.length > 0 || cnameRecords.length > 0) {
+      result.configured = true;
+    }
+  } catch (err: any) {
+    result.error = err.message;
+  }
+
+  res.json(result);
+});
+
+// Username + Password Login Endpoint (Secure & Robust)
+app.post("/api/auth/login", (req, res) => {
+  const { username, password, deviceInfo } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: "Foydalanuvchi nomi va parol talab qilinadi." });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+
+  // Rate limiting / Brute-force protection
+  if (isRateLimited(cleanUsername)) {
+    return res.status(429).json({ error: "Siz juda ko'p marta xato urindingiz. Iltimos, 1 daqiqadan so'ng qayta urinib ko'ring." });
+  }
+
+  const user = users.find(u => u.username.toLowerCase() === cleanUsername);
+  if (!user) {
+    registerLoginAttempt(cleanUsername, false);
+    return res.status(401).json({ error: "Foydalanuvchi nomi yoki parol noto'g'ri." });
+  }
+
+  const hash = hashPassword(password);
+  if (user.password_hash !== hash) {
+    registerLoginAttempt(cleanUsername, false);
+    return res.status(401).json({ error: "Foydalanuvchi nomi yoki parol noto'g'ri." });
+  }
+
+  // Clear rate limits
+  registerLoginAttempt(cleanUsername, true);
+
+  // Update session state
+  user.isOnline = true;
+  user.lastActive = new Date().toISOString();
+  user.lastLogin = new Date().toISOString();
+  user.last_login = new Date().toISOString();
+  if (deviceInfo) {
+    user.deviceInfo = {
+      browser: deviceInfo.browser || "Chrome",
+      os: deviceInfo.os || "Windows",
+      deviceType: deviceInfo.deviceType || "Desktop",
+      loginTime: new Date().toISOString()
+    };
+  }
+
+  saveDB({ users, activities, flags });
+
+  logUserActivity(user.id, user.name, "Muvaffaqiyatli Login", "Tizimga muvaffaqiyatli kirdi.", user.deviceInfo);
+
+  const clientUser = { ...user };
+  delete clientUser.password_hash; // Premium security: do not leak hash!
+
+  res.json({ success: true, user: clientUser });
+});
+
+// Simple counter map for account creations per client fingerprint
+const accountCreations = new Map<string, number>();
+
+// Self-Registration Endpoint for Standard Users (limit 3 per fingerprint)
+app.post("/api/auth/register", (req, res) => {
+  const { username, password, name, clientFingerprint, deviceInfo } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: "Foydalanuvchi nomi va parol kiritilishi shart." });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+  
+  if (cleanUsername === "admin") {
+    return res.status(400).json({ error: "Ushbu foydalanuvchi nomi tizim tomonidan himoyalangan." });
+  }
+
+  const fingerprint = clientFingerprint || "unknown_client";
+  const count = accountCreations.get(fingerprint) || 0;
+  if (count >= 3) {
+    return res.status(429).json({ error: "Siz ushbu qurilmadan allaqachon 3 marta hisob yaratgansiz. Ko'p hisob ochish taqiqlanadi!" });
+  }
+
+  const existing = users.find(u => u.username.toLowerCase() === cleanUsername);
+  if (existing) {
+    return res.status(400).json({ error: "Ushbu foydalanuvchi nomi allaqachon band. Iltimos, boshqasini tanlang." });
+  }
+
+  const newUserId = `user_${Date.now()}`;
+  const nowStr = new Date().toISOString();
+  const newUser: User = {
+    id: newUserId,
+    username: cleanUsername,
+    password_hash: hashPassword(password),
+    name: name?.trim() || username.trim(),
+    notes: "O'zi ro'yxatdan o'tgan foydalanuvchi",
+    role: "user",
+    status: "active",
+    isOnline: false,
+    lastActive: nowStr,
+    createdAt: nowStr,
+    updatedAt: nowStr,
+    created_at: nowStr,
+    updated_at: nowStr,
+    lastLogin: null,
+    last_login: null,
+    createdBy: "self_registered",
+    created_by: "self_registered",
+    deviceInfo: {
+      browser: deviceInfo?.browser || "Chrome",
+      os: deviceInfo?.os || "Windows",
+      deviceType: deviceInfo?.deviceType || "Desktop",
+      loginTime: nowStr
+    }
+  };
+
+  users.push(newUser);
+  accountCreations.set(fingerprint, count + 1);
+
+  saveDB({ users, activities, flags });
+
+  logUserActivity(newUser.id, newUser.name, "Muvaffaqiyatli Ro'yxatdan o'tish", "Yangi hisob yaratdi va tizimga qo'shildi.", newUser.deviceInfo);
+
+  broadcastToAdmins("stateUpdate", { users, activities, flags, stats: getStats() });
+
+  const clientUser = { ...newUser };
+  delete clientUser.password_hash;
+  res.json({ success: true, user: clientUser });
+});
+
+// Admin-Only Password Access Endpoint
+app.post("/api/auth/admin-login", (req, res) => {
+  const { password, deviceInfo } = req.body;
+  if (!password) {
+    return res.status(400).json({ error: "Administrator paroli talab qilinadi." });
+  }
+
+  if (password !== currentAdminPassword) {
+    return res.status(401).json({ error: "Xato administrator paroli! Kirish qat'iyan taqiqlanadi." });
+  }
+
+  let adminUser = users.find(u => u.username === "admin" && u.role === "admin");
+  if (!adminUser) {
+    initializeDB();
+    adminUser = users.find(u => u.username === "admin" && u.role === "admin");
+  }
+
+  if (adminUser) {
+    adminUser.isOnline = true;
+    adminUser.lastActive = new Date().toISOString();
+    adminUser.lastLogin = new Date().toISOString();
+    adminUser.last_login = new Date().toISOString();
+    if (deviceInfo) {
+      adminUser.deviceInfo = {
+        browser: deviceInfo.browser || "Chrome",
+        os: deviceInfo.os || "Windows",
+        deviceType: deviceInfo.deviceType || "Desktop",
+        loginTime: new Date().toISOString()
+      };
+    }
+  }
+
+  saveDB({ users, activities, flags });
+
+  if (adminUser) {
+    logUserActivity(adminUser.id, adminUser.name, "Muvaffaqiyatli Admin Login", "Admin paroli bilan to'g'ridan-to'g'ri kirdi.", adminUser.deviceInfo);
+  }
+
+  const clientUser = adminUser ? { ...adminUser } : null;
+  if (clientUser) {
+    delete clientUser.password_hash;
+  }
+
+  res.json({ success: true, user: clientUser });
+});
+
+// Endpoint to dynamically change administrator password
+app.post("/api/auth/change-admin-password", (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: "Amaldagi va yangi parollar to'liq kiritilishi shart!" });
+  }
+
+  if (currentPassword !== currentAdminPassword) {
+    return res.status(401).json({ error: "Amaldagi administrator paroli noto'g'ri kiritildi!" });
+  }
+
+  const trimmedNewPassword = newPassword.trim();
+  if (trimmedNewPassword.length < 4) {
+    return res.status(400).json({ error: "Yangi parol uzunligi kamida 4 ta belgidan iborat bo'lishi kerak!" });
+  }
+
+  currentAdminPassword = trimmedNewPassword;
+  const store = loadDB() as any;
+  store.adminPassword = currentAdminPassword;
+  
+  // Also update the admin user's password_hash
+  const adminUser = store.users.find((u: any) => u.username === "admin" && u.role === "admin");
+  if (adminUser) {
+    adminUser.password_hash = hashPassword(currentAdminPassword);
+    adminUser.updatedAt = new Date().toISOString();
+    adminUser.updated_at = new Date().toISOString();
+  }
+  
+  // Log activity
+  const newLog = {
+    id: `act_${Date.now()}`,
+    userId: "admin_user_id",
+    userName: "Administrator",
+    action: "Change Password",
+    details: "Admin o'z parolini muvaffaqiyatli o'zgartirdi.",
+    timestamp: new Date().toISOString(),
+    device: "Server",
+    browser: "Chrome",
+    os: "Linux"
+  };
+  activities.unshift(newLog);
+  store.activities = activities;
+  
+  saveDB(store);
+  users = store.users; // Sync in-memory users list
+
+  broadcastToAdmins("stateUpdate", { users, activities, flags, stats: getStats() });
+
+  res.json({ success: true, message: "Parol muvaffaqiyatli o'zgartirildi!" });
+});
+
+// Admin-Only: Create New User Account
+app.post("/api/admin/create-user", (req, res) => {
+  const { username, password, name, notes, adminId } = req.body;
+  
+  // Validate request is from an authorized Admin
+  const admin = users.find(u => u.id === adminId && u.role === "admin");
+  if (!admin) {
+    return res.status(403).json({ error: "Ruxsat etilmagan amal: Faqat administrator foydalanuvchi yarata oladi." });
+  }
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Foydalanuvchi nomi va parol kiritilishi shart." });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+  
+  // Enforce username uniqueness
+  const existing = users.find(u => u.username.toLowerCase() === cleanUsername);
+  if (existing) {
+    return res.status(400).json({ error: "Ushbu foydalanuvchi nomi allaqachon band. Iltimos, boshqa nom tanlang." });
+  }
+
+  const newUserId = `user_${Date.now()}`;
+  const nowStr = new Date().toISOString();
+  const newUser: User = {
+    id: newUserId,
+    username: cleanUsername,
+    password_hash: hashPassword(password),
+    name: name?.trim() || username.trim(),
+    notes: notes?.trim() || "",
+    role: "user",
+    status: "active",
+    isOnline: false,
+    lastActive: nowStr,
+    createdAt: nowStr,
+    updatedAt: nowStr,
+    created_at: nowStr,
+    updated_at: nowStr,
+    lastLogin: null,
+    last_login: null,
+    createdBy: admin.username,
+    created_by: admin.username,
+    deviceInfo: {
+      browser: "N/A",
+      os: "N/A",
+      deviceType: "Desktop",
+      loginTime: nowStr
+    }
+  };
+
+  users.push(newUser);
+  saveDB({ users, activities, flags });
+
+  logUserActivity(adminId, admin.name, "Create User", `Yangi foydalanuvchi "${cleanUsername}" muvaffaqiyatli yaratildi.`, admin.deviceInfo);
+
+  broadcastToAdmins("stateUpdate", { users, activities, flags, stats: getStats() });
+
+  const clientUser = { ...newUser };
+  delete clientUser.password_hash;
+  res.json({ success: true, user: clientUser });
+});
+
+// Admin-Only: Update User Account details (Username, Password, Name, Notes, Status)
+app.post("/api/admin/update-user", (req, res) => {
+  const { userId, username, password, name, notes, status, adminId } = req.body;
+
+  // Validate request is from an authorized Admin
+  const admin = users.find(u => u.id === adminId && u.role === "admin");
+  if (!admin) {
+    return res.status(403).json({ error: "Ruxsat etilmagan amal: Faqat administrator foydalanuvchini tahrirlay oladi." });
+  }
+
+  const user = users.find(u => u.id === userId);
+  if (!user) {
+    return res.status(404).json({ error: "Foydalanuvchi topilmadi." });
+  }
+
+  // Safety protection for admin
+  if (user.role === "admin" && user.username === "admin") {
+    if (status && status !== "active") {
+      return res.status(400).json({ error: "Asosiy administrator hisobini bloklash yoki cheklash taqiqlanadi!" });
+    }
+  }
+
+  if (username) {
+    const cleanUsername = username.trim().toLowerCase();
+    if (cleanUsername !== user.username) {
+      const existing = users.find(u => u.username.toLowerCase() === cleanUsername);
+      if (existing) {
+        return res.status(400).json({ error: "Ushbu foydalanuvchi nomi tizimda band." });
+      }
+      user.username = cleanUsername;
+    }
+  }
+
+  if (password) {
+    user.password_hash = hashPassword(password);
+  }
+
+  if (name !== undefined) {
+    user.name = name.trim() || user.username;
+  }
+
+  if (notes !== undefined) {
+    user.notes = notes.trim();
+  }
+
+  if (status !== undefined) {
+    user.status = status;
+    if (status === "active") {
+      user.restrictionReason = undefined;
+    }
+  }
+
+  const nowStr = new Date().toISOString();
+  user.updatedAt = nowStr;
+  user.updated_at = nowStr;
+
+  saveDB({ users, activities, flags });
+
+  logUserActivity(adminId, admin.name, "Update User", `"${user.username}" foydalanuvchi hisobi tahrirlandi.`, admin.deviceInfo);
+
+  broadcastToAdmins("stateUpdate", { users, activities, flags, stats: getStats() });
+
+  const clientUser = { ...user };
+  delete clientUser.password_hash;
+  res.json({ success: true, user: clientUser });
+});
+
+// Legacy Unblock passcode bypass endpoint (Updated for Username + Password System compatibility)
+app.post("/api/auth/unblock-user", (req, res) => {
+  const { userId, passcode } = req.body;
+  if (!userId || !passcode) {
+    return res.status(400).json({ error: "Foydalanuvchi IDsi va parol talab qilinadi!" });
+  }
+
+  if (passcode !== "block_1234" && passcode !== currentAdminPassword) {
+    return res.status(400).json({ error: "Noto'g'ri unblock paroli!" });
+  }
+
+  const user = users.find(u => u.id === userId);
+  if (!user) {
+    return res.status(404).json({ error: "Foydalanuvchi topilmadi!" });
+  }
+
+  user.status = "active";
+  user.restrictionReason = undefined;
+  user.updatedAt = new Date().toISOString();
+  user.updated_at = new Date().toISOString();
+
+  saveDB({ users, activities, flags });
+
+  logUserActivity(user.id, user.name, "Unblocked", "Foydalanuvchi bypass paroli orqali blockdan ochildi.", user.deviceInfo);
+
+  broadcastToAdmins("stateUpdate", {
+    users,
+    activities,
+    flags,
+    stats: getStats()
+  });
+
+  const clientUser = { ...user };
+  delete clientUser.password_hash;
+  res.json({ success: true, user: clientUser });
+});
+
+// Admin command center actions
+app.post("/api/admin/user-action", (req, res) => {
+  const { userId, action, reason, adminId } = req.body; // action: "block" | "unblock" | "restrict" | "delete"
+
+  // Check admin authorization
+  const admin = users.find(u => u.id === adminId && u.role === "admin");
+  if (!admin) {
+    return res.status(403).json({ error: "Ruxsat etilmagan amal: Faqat administrator ushbu amalni bajara oladi." });
+  }
+
+  const user = users.find(u => u.id === userId);
+  if (!user) return res.status(404).json({ error: "Foydalanuvchi topilmadi" });
+
+  if (action === "block") {
+    if (user.role === "admin" && user.username === "admin") {
+      return res.status(400).json({ error: "Administratorni bloklash taqiqlanadi!" });
+    }
+    user.status = "blocked";
+  } else if (action === "unblock") {
+    user.status = "active";
+    user.restrictionReason = undefined;
+  } else if (action === "restrict") {
+    if (user.role === "admin" && user.username === "admin") {
+      return res.status(400).json({ error: "Administratorni cheklash taqiqlanadi!" });
+    }
+    user.status = "restricted";
+    user.restrictionReason = reason || "Tizim qoidalari buzildi.";
+  } else if (action === "delete") {
+    if (user.role === "admin" && user.username === "admin") {
+      return res.status(400).json({ error: "Administratorni o'chirish taqiqlanadi!" });
+    }
+    users = users.filter(u => u.id !== userId);
+  }
+
+  // Check if there is an active flag for this user and resolve it
+  flags.forEach(f => {
+    if (f.userId === userId) {
+      f.status = action === "block" ? "resolved_blocked" : action === "restrict" ? "resolved_restricted" : "resolved_cleared";
+    }
+  });
+
+  saveDB({ users, activities, flags });
+
+  logUserActivity(adminId, admin.name, `Admin Action: ${action}`, `"${user.username}" foydalanuvchiga qarshi "${action}" amali bajarildi.`, admin.deviceInfo);
+
+  broadcastToAdmins("stateUpdate", {
+    users,
+    activities,
+    flags,
+    stats: getStats()
+  });
+
+  const clientUser = { ...user };
+  delete clientUser.password_hash;
+  res.json({ success: true, user: clientUser });
+});
+
+// Resolve flag directly
+app.post("/api/admin/resolve-flag", (req, res) => {
+  const { flagId, status, adminId } = req.body; // status: "resolved_cleared" | etc.
+
+  // Check admin authorization
+  const admin = users.find(u => u.id === adminId && u.role === "admin");
+  if (!admin) {
+    return res.status(403).json({ error: "Ruxsat etilmagan amal: Faqat administrator ushbu amalni bajara oladi." });
+  }
+
+  const flag = flags.find(f => f.id === flagId);
+  if (flag) {
+    flag.status = status;
+    saveDB({ users, activities, flags });
+    broadcastToAdmins("stateUpdate", {
+      users,
+      activities,
+      flags,
+      stats: getStats()
+    });
+  }
+  res.json({ success: true });
+});
+
+// Flag user trigger from client (Red team security / suspicious AI trigger)
+app.post("/api/telemetry/flag-user", (req, res) => {
+  const { userId, action, reason, details } = req.body;
+  const user = users.find(u => u.id === userId);
+  if (!user) return res.status(404).json({ error: "Foydalanuvchi topilmadi" });
+
+  const newFlag: AdminReviewFlag = {
+    id: `flag_${Date.now()}`,
+    userId,
+    userName: user.name,
+    action,
+    reason,
+    timestamp: new Date().toISOString(),
+    status: "pending",
+    details: details || "Tafsilotlar tekshirilmoqda..."
+  };
+
+  flags.unshift(newFlag);
+  saveDB({ users, activities, flags });
+  
+  broadcastToAdmins("stateUpdate", {
+    users,
+    activities,
+    flags,
+    stats: getStats()
+  });
+
+  res.json({ success: true, flag: newFlag });
+});
+
+
+// -------------------------------------------------------------
+// GEMINI INTELLIGENT COMPILERS & TEACHER PIPELINES
+// -------------------------------------------------------------
+
+// 1. Text Segmentation and Detailed Explanation Generation
+app.post("/api/learning/upload", async (req, res) => {
+  const { text, title, userId, userName, deviceInfo } = req.body;
+  if (!text) return res.status(400).json({ error: "Matn taqdim etilmadi." });
+
+  try {
+    const ai = getGemini();
+
+    const prompt = `You are an expert tutor. Please analyze the following text completely.
+    1. Explain the text in Uzbek in an extremely simple, clear, and concise manner so that even a complete beginner or someone who has no background can grab it immediately.
+    Your explanations should be brief, simple, direct, and clear, yet cover EVERYTHING in the provided text without omitting any key information. Do not make it overly long or bloated.
+    - If the input text is short (e.g., under 15 sentences), generate exactly 1-2 sections.
+    - If the input text is longer, generate exactly 2-3 sections. Keep it highly focused and very short but comprehensive.
+
+    2. Generate a comprehensive interactive quiz in Uzbek containing at least 6-10 easy, clear, and direct questions that cover EVERY single section, concept, key term, and content detail of the text completely. Do not limit the questions to just 3-4; generate questions for all aspects of the text so the user can test their knowledge on everything. Keep the questions simple, clear, and direct.
+    The quiz must have a mix of three types:
+    - "multiple-choice" (provide exactly 4 options)
+    - "true-false" (correctAnswer must be exactly "True" or "False")
+    - "short-answer" (the correctAnswer should be a very concise, 1-3 word key term in Uzbek)
+    
+    You must structure your response exactly as JSON conforming to the following schema structure:
+    {
+      "sections": [
+        {
+          "title": "Bo'lim sarlavhasi (Simple & Clear)",
+          "summary": "Ushbu bo'limning juda qisqa va tushunarli mazmuni (Extremely simple, 1-2 sentences)",
+          "concepts": [
+            { "term": "Atama yoki tushuncha", "definition": "Atamaning juda oddiy tilda tushuntirilishi" }
+          ],
+          "content": "Juda oddiy, lo'nda va qisqa tushuntirish matni (Use clear formatting, make it extremely simple, short and easy to understand for anyone)",
+          "example": "Ushbu bo'limga tegishli hayotiy va juda oddiy misol"
+        }
+      ],
+      "quiz": [
+        {
+          "type": "multiple-choice | true-false | short-answer",
+          "question": "Savol matni (In Uzbek)",
+          "options": ["Variant A", "Variant B", "Variant C", "Variant D"],
+          "correctAnswer": "To'g'ri javob matni (yoki 'True'/'False')",
+          "explanation": "Nega ushbu javob to'g'riligi va uning ilmiy asosi haqida AI O'qituvchining batafsil tushuntirishi (In Uzbek)",
+          "topic": "Savol tegishli bo'lgan bo'lim nomi"
+        }
+      ]
+    }
+
+    Text to analyze:
+    "${text}"`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            sections: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  summary: { type: Type.STRING },
+                  concepts: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        term: { type: Type.STRING },
+                        definition: { type: Type.STRING }
+                      },
+                      required: ["term", "definition"]
+                    }
+                  },
+                  content: { type: Type.STRING },
+                  example: { type: Type.STRING }
+                },
+                required: ["title", "summary", "concepts", "content"]
+              }
+            },
+            quiz: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  question: { type: Type.STRING },
+                  options: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING }
+                  },
+                  correctAnswer: { type: Type.STRING },
+                  explanation: { type: Type.STRING },
+                  topic: { type: Type.STRING }
+                },
+                required: ["type", "question", "correctAnswer", "explanation", "topic"]
+              }
+            }
+          },
+          required: ["sections", "quiz"]
+        }
+      }
+    });
+
+    const parsedData = JSON.parse(response.text || "{}");
+    const sectionsWithIds = (parsedData.sections || []).map((sec: any, idx: number) => ({
+      id: `sec_${idx + 1}_${Date.now()}`,
+      ...sec
+    }));
+
+    const quizWithIds = (parsedData.quiz || []).map((q: any, idx: number) => ({
+      id: `q_${idx + 1}_${Date.now()}`,
+      ...q
+    }));
+
+    const documentUpload = {
+      id: `doc_${Date.now()}`,
+      title: title || (text.slice(0, 30) + "..."),
+      content: text,
+      sections: sectionsWithIds,
+      quiz: quizWithIds,
+      createdAt: new Date().toISOString()
+    };
+
+    if (userId && userName) {
+      logUserActivity(userId, userName, "Upload text", `"${documentUpload.title}" hujjatini tizimga yukladi va bo'limlarga ajratdi.`, deviceInfo);
+    }
+
+    res.json(documentUpload);
+
+  } catch (error: any) {
+    console.error("Gemini Upload Error:", error);
+    res.status(500).json({ error: "Gemini AI matnni tahlil qila olmadi: " + error.message });
+  }
+});
+
+// TTS Proxy endpoint to handle Translate TTS on server side (No referrer and CORS issues in Node.js)
+app.get("/api/learning/tts-proxy", async (req, res) => {
+  const { q } = req.query;
+  if (!q) {
+    return res.status(400).send("Text parameter 'q' is required");
+  }
+
+  const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=uz&client=tw-ob&q=${encodeURIComponent(String(q))}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://translate.google.com/"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google Translate responded with status ${response.status}`);
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=31536000");
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    res.send(buffer);
+  } catch (error: any) {
+    console.error("TTS Proxy API Error:", error.message);
+    res.status(500).send("Failed to retrieve text-to-speech stream");
+  }
+});
+
+// 2. Comprehensive Question Engine (Generates mixed multi-choice, true-false, short-answer)
+app.post("/api/learning/generate-quiz", async (req, res) => {
+  const { documentTitle, sections, userId, userName, deviceInfo } = req.body;
+  if (!sections || sections.length === 0) {
+    return res.status(400).json({ error: "Tahlil qilingan bo'limlar topilmadi." });
+  }
+
+  try {
+    const ai = getGemini();
+
+    const sectionsTextSummary = sections.map((s: any) => `Bo'lim: ${s.title}\nMazmuni: ${s.summary}\nBatafsil: ${s.content}`).join("\n---\n");
+
+    const numQuestions = "kamida 6-10 ta";
+    const prompt = `You are a helpful and professional examiner. Read the following learning sections entirely.
+    Generate a comprehensive interactive quiz in Uzbek containing ${numQuestions} easy, clear, and direct questions that cover EVERY single section, concept, key term, and content detail of the material completely. Do not limit the questions to just a few; generate questions for all aspects of the text so the user can test their knowledge on everything. Keep the questions simple, clear, and direct.
+    The quiz must have a mix of three types:
+    1. "multiple-choice" (provide exactly 4 options)
+    2. "true-false" (correctAnswer must be exactly "True" or "False")
+    3. "short-answer" (the correctAnswer should be a very concise, 1-3 word key term)
+
+    Response must strictly follow this JSON schema:
+    {
+      "questions": [
+        {
+          "type": "multiple-choice | true-false | short-answer",
+          "question": "Savol matni (In Uzbek)",
+          "options": ["Variant A", "Variant B", "Variant C", "Variant D"],
+          "correctAnswer": "To'g'ri javob matni (yoki 'True'/'False')",
+          "explanation": "Nega ushbu javob to'g'riligi va uning ilmiy asosi haqida AI O'qituvchining batafsil tushuntirishi (In Uzbek)",
+          "topic": "Savol tegishli bo'lgan bo'lim nomi (In Uzbek)"
+        }
+      ]
+    }
+
+    Learning Sections Content:
+    ${sectionsTextSummary}`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            questions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  question: { type: Type.STRING },
+                  options: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING }
+                  },
+                  correctAnswer: { type: Type.STRING },
+                  explanation: { type: Type.STRING },
+                  topic: { type: Type.STRING }
+                },
+                required: ["type", "question", "correctAnswer", "explanation", "topic"]
+              }
+            }
+          },
+          required: ["questions"]
+        }
+      }
+    });
+
+    const parsedData = JSON.parse(response.text || "{}");
+    const questionsWithIds = (parsedData.questions || []).map((q: any, idx: number) => ({
+      id: `q_${idx + 1}_${Date.now()}`,
+      ...q
+    }));
+
+    if (userId && userName) {
+      logUserActivity(userId, userName, "Start quiz", `"${documentTitle}" mavzusi bo'yicha super quiz sessiyasini boshladi.`, deviceInfo);
+    }
+
+    res.json({ questions: questionsWithIds });
+
+  } catch (error: any) {
+    console.error("Gemini Quiz Generation Error:", error);
+    res.status(500).json({ error: "Quiz savollari generatsiya qilinayotganda xatolik yuz berdi: " + error.message });
+  }
+});
+
+// 3. AI Teacher Mode Evaluation & Adaptive Explainer
+app.post("/api/learning/evaluate-answer", async (req, res) => {
+  const { question, userAnswer, userId, userName, deviceInfo } = req.body;
+  if (!question) return res.status(400).json({ error: "Savol taqdim etilmadi." });
+
+  try {
+    const ai = getGemini();
+
+    const prompt = `You are an expert high-fidelity AI Teacher and evaluation analyst in Uzbek.
+    Analyze the student's answer for the following question accurately and without any errors.
+    
+    CRITICAL EVALUATION RULES:
+    1. For multiple-choice (options) or True/False (to'g'ri/noto'g'ri) questions, evaluate strictly based on correctness. Ignore casing, spaces, or prepended labels like "a)", "b)", "1.".
+    2. For short-answer or written questions, accept semantically equivalent answers. Allow minor typos, spelling mistakes, or synonyms. If the student clearly understands the core concept, mark it as isCorrect: true.
+    3. scorePercent should represent the accuracy from 0 to 100. If correct or mostly correct, it should be high (e.g., 80-100).
+    
+    AI-CHEAT DETECTION RULES:
+    - Set "isAI" to true ONLY if you are 100% absolutely confident the answer is copy-pasted from an LLM.
+    - An answer should ONLY be considered AI-generated if it is highly structured with bullet points (e.g. "1.", "2."), formal preambles (like "Albatta,", "Ushbu savolga kelsak,"), and is exceptionally long (over 150 characters).
+    - If the student's answer is less than 150 characters, "isAI" MUST always be false. No exceptions.
+    
+    If "isAI" is true:
+    - Set "isCorrect" to false, "scorePercent" to 0, and write a firm warning in "feedback" and "explanation" about not using AI to cheat.
+    
+    If "isAI" is false:
+    - Write a highly encouraging, friendly, and educational feedback in Uzbek.
+    - Explain why the answer is correct or incorrect in a simple, memorable way in Uzbek.
+    - If incorrect, propose 1 simple related follow-up question (multiple-choice or true/false) to test their understanding immediately.
+
+    Question detail:
+    - Type: ${question.type}
+    - Question: ${question.question}
+    - Correct reference answer: ${question.correctAnswer}
+    - Student's answer: ${userAnswer}`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            isAI: { type: Type.BOOLEAN },
+            isCorrect: { type: Type.BOOLEAN },
+            scorePercent: { type: Type.INTEGER },
+            feedback: { type: Type.STRING },
+            explanation: { type: Type.STRING },
+            followUp: {
+              type: Type.OBJECT,
+              properties: {
+                question: { type: Type.STRING },
+                type: { type: Type.STRING },
+                options: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
+                },
+                correctAnswer: { type: Type.STRING }
+              },
+              required: ["question", "type", "correctAnswer"]
+            }
+          },
+          required: ["isAI", "isCorrect", "scorePercent", "feedback", "explanation"]
+        }
+      }
+    });
+
+    const result = JSON.parse(response.text || "{}");
+
+    // Handle AI Cheat detection
+    if (result.isAI === true) {
+      const blockReason = "Savolga javob berishda Sun'iy Intellekt (AI) yordamidan foydalandingiz! Tizim buni 100% aniqladi va hisobingizni blokladi.";
+      
+      // Instantly block the user
+      const user = users.find(u => u.id === userId);
+      if (user) {
+        user.status = "blocked";
+        user.restrictionReason = blockReason;
+      }
+
+      // Create admin flag
+      const newFlag: AdminReviewFlag = {
+        id: `flag_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+        userId: userId || "unknown",
+        userName: userName || "Noma'lum foydalanuvchi",
+        action: "AI cheat detected",
+        reason: "Javobda Sun'iy Intellekt (AI) ishlatilgani aniqlandi.",
+        timestamp: new Date().toISOString(),
+        status: "pending",
+        details: `O'quvchi javobni AIdan ko'chirib olganligi 100% aniqlandi. Javob matni: "${userAnswer}"`
+      };
+      flags.unshift(newFlag);
+
+      if (userId && userName) {
+        logUserActivity(userId, userName, "AI cheat detected", "Darslik testida AI ishlatgani uchun tizim tomonidan bloklandi.", deviceInfo);
+      }
+
+      // Broadcast update to Admin Panel
+      broadcastToAdmins("stateUpdate", {
+        users,
+        activities,
+        flags,
+        stats: getStats()
+      });
+
+      return res.json({
+        isBlocked: true,
+        reason: blockReason,
+        isCorrect: false,
+        scorePercent: 0,
+        feedback: "AI aniqlandi! Tizim sizni blokladi. Admin bilan bog'laning.",
+        explanation: "Siz savolga inson kabi o'zingiz fikrlab javob berishingiz kerak edi. Ko'chirib olingan matnlar qat'iyan taqiqlanadi."
+      });
+    }
+
+    if (userId && userName) {
+      const details = result.isCorrect 
+        ? `"${question.question.slice(0, 40)}..." savoliga To'g'ri javob berdi.` 
+        : `"${question.question.slice(0, 40)}..." savoliga Noto'g'ri javob berdi. AI tushuntirmoqda.`;
+      logUserActivity(userId, userName, "Quiz answer", details, deviceInfo);
+    }
+
+    res.json(result);
+
+  } catch (error: any) {
+    console.error("Gemini Evaluation Error:", error);
+    res.status(500).json({ error: "Javobni tahlil qilishda xatolik yuz berdi: " + error.message });
+  }
+});
+
+// 4. Custom Uzbek TTS generator using gemini-3.1-flash-tts-preview
+app.post("/api/learning/tts", async (req, res) => {
+  const { text, voiceType } = req.body;
+  if (!text) return res.status(400).json({ error: "Matn taqdim etilmadi." });
+
+  try {
+    const ai = getGemini();
+
+    const voiceName = voiceType === "female" ? "Kore" : voiceType === "male" ? "Fenrir" : "Zephyr";
+
+    // Clean text and request the TTS model to output audio
+    const cleanText = text.replace(/[#*`_~]/g, "").slice(0, 1000);
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-tts-preview",
+      contents: [{ parts: [{ text: cleanText }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName }
+          }
+        }
+      }
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      res.json({ success: true, base64Audio });
+    } else {
+      res.status(500).json({ error: "Audio jeneratsiya qilinmadi (javob bo'sh)." });
+    }
+
+  } catch (error: any) {
+    console.error("Gemini TTS Error:", error);
+    // Return friendly error so client handles browser speech synthesis fallback gracefully
+    res.status(500).json({ error: "Gemini TTS xizmati mavjud emas: " + error.message });
+  }
+});
+
+
+// -------------------------------------------------------------
+// VITE DEV SERVER & STATIC MIDDLEWARE SETUP
+// -------------------------------------------------------------
+
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server is running at http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();

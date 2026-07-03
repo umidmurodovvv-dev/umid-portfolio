@@ -1,0 +1,279 @@
+let currentAudio: HTMLAudioElement | null = null;
+let googlePlayTimeout: any = null;
+let isGooglePlaying = false;
+let browserUtterance: SpeechSynthesisUtterance | null = null;
+let audioContext: AudioContext | null = null;
+let audioSource: AudioBufferSourceNode | null = null;
+
+// Helper to split text into safe, pronounceable chunks for Google Translate TTS (max 250 chars)
+export const splitTextIntoChunks = (text: string, maxLength: number = 250): string[] => {
+  // Remove markdown, links, brackets, etc.
+  const cleanText = text
+    .replace(/[#*`_~]/g, "")
+    .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // markdown links -> text
+    .trim();
+
+  // Split only by periods, exclamations, and question marks, preserving the punctuation (commas, semicolons, etc. are kept in chunk)
+  const regex = /[^.!?]+(?:[.!?]+(?:\s+|$)|$)/g;
+  const matches = cleanText.match(regex) || [cleanText];
+  const chunks: string[] = [];
+
+  for (let match of matches) {
+    match = match.trim();
+    if (!match) continue;
+
+    if (match.length <= maxLength) {
+      chunks.push(match);
+    } else {
+      // Split long match by spaces
+      const words = match.split(/\s+/);
+      let current = "";
+      for (const word of words) {
+        if ((current + " " + word).trim().length <= maxLength) {
+          current = (current + " " + word).trim();
+        } else {
+          if (current) chunks.push(current);
+          current = word;
+        }
+      }
+      if (current) chunks.push(current);
+    }
+  }
+
+  return chunks;
+};
+
+// Find the best phonetic browser voice for fallback
+const getBestSpeechVoice = (gender: "male" | "female"): SpeechSynthesisVoice | null => {
+  if (typeof window === "undefined" || !window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices();
+  
+  // Try languages in order of proximity: Uzbek (uz), Azerbaijani (az), Turkish (tr), Russian (ru), English (en)
+  const targetLangs = ["uz", "az", "tr", "ru", "en"];
+  
+  for (const lang of targetLangs) {
+    const matching = voices.filter(v => v.lang.toLowerCase().startsWith(lang));
+    if (matching.length > 0) {
+      if (gender === "male") {
+        const male = matching.find(v => {
+          const name = v.name.toLowerCase();
+          return name.includes("male") || name.includes("david") || name.includes("george") || 
+                 name.includes("guy") || name.includes("stefan") || name.includes("pavel");
+        });
+        if (male) return male;
+      } else {
+        const female = matching.find(v => {
+          const name = v.name.toLowerCase();
+          return name.includes("female") || name.includes("zira") || name.includes("hazel") || 
+                 name.includes("jessa") || name.includes("elena") || name.includes("maria");
+        });
+        if (female) return female;
+      }
+      return matching[0];
+    }
+  }
+  return voices[0] || null;
+};
+
+export const stopTts = () => {
+  isGooglePlaying = false;
+  if (currentAudio) {
+    try {
+      currentAudio.pause();
+      currentAudio.src = "";
+    } catch (e) {}
+    currentAudio = null;
+  }
+  if (googlePlayTimeout) {
+    clearTimeout(googlePlayTimeout);
+    googlePlayTimeout = null;
+  }
+  if (typeof window !== "undefined" && window.speechSynthesis) {
+    window.speechSynthesis.cancel();
+  }
+  browserUtterance = null;
+
+  if (audioSource) {
+    try {
+      audioSource.stop();
+    } catch (e) {}
+    audioSource = null;
+  }
+  if (audioContext) {
+    try {
+      audioContext.close();
+    } catch (e) {}
+    audioContext = null;
+  }
+};
+
+
+const playPcmAudio = (base64Data: string, sampleRate: number = 24000): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    try {
+      if (typeof window === "undefined") {
+        reject("Browser environment required");
+        return;
+      }
+
+      // Create or resume AudioContext
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+
+      if (audioContext.state === "suspended") {
+        audioContext.resume();
+      }
+
+      // Base64 decode to binary string
+      const binaryString = atob(base64Data);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert 16-bit PCM little-endian bytes to Float32 [-1.0, 1.0]
+      const numSamples = len / 2;
+      const int16Samples = new Int16Array(bytes.buffer);
+      const float32Samples = new Float32Array(numSamples);
+      for (let i = 0; i < numSamples; i++) {
+        float32Samples[i] = int16Samples[i] / 32768.0;
+      }
+
+      // Create AudioBuffer
+      const buffer = audioContext.createBuffer(1, numSamples, sampleRate);
+      buffer.copyToChannel(float32Samples, 0);
+
+      // Create BufferSource
+      const source = audioContext.createBufferSource();
+      audioSource = source;
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+
+      source.onended = () => {
+        if (audioSource === source) {
+          audioSource = null;
+        }
+        resolve();
+      };
+
+      source.start(0);
+    } catch (err) {
+      reject(err);
+    }
+  });
+};
+
+export const speakText = async (
+  text: string,
+  voiceType: "male" | "female",
+  onStart: () => void,
+  onEnd: () => void,
+  onError: (err: string) => void
+) => {
+  stopTts();
+  onStart();
+
+  const activeVoiceType = voiceType || (localStorage.getItem("voice_preference") as "male" | "female") || "female";
+
+  const chunks = splitTextIntoChunks(text);
+  if (chunks.length === 0) {
+    onEnd();
+    return;
+  }
+
+  isGooglePlaying = true;
+  let index = 0;
+
+  const playNext = () => {
+    if (!isGooglePlaying) return;
+    if (index >= chunks.length) {
+      isGooglePlaying = false;
+      onEnd();
+      return;
+    }
+
+    const chunk = chunks[index];
+
+    // Play immediately using native speech synthesis optimized for gender
+    speakNativeFallback(chunk, activeVoiceType, () => {
+      if (!isGooglePlaying) return;
+      index++;
+      
+      const trimmed = chunk.trim();
+      const endsWithSentencePunctuation = /[.!?]$/.test(trimmed);
+      
+      // If chunk ends with a period, exclamation, or question mark, pause for exactly 100ms (0.1s).
+      // For commas and other elements, do not pause (0ms gap).
+      const pauseDuration = endsWithSentencePunctuation ? 100 : 0;
+      
+      googlePlayTimeout = setTimeout(playNext, pauseDuration);
+    }, onError);
+  };
+
+  playNext();
+};
+
+const speakNativeFallback = (text: string, gender: "male" | "female", onEnd: () => void, onError: (err: string) => void) => {
+  if (typeof window === "undefined" || !window.speechSynthesis) {
+    onError("Sizning brauzeringiz ovozli o'qishni qo'llab-quvvatlamaydi.");
+    onEnd();
+    return;
+  }
+
+  window.speechSynthesis.cancel();
+  
+  // Strip markdown
+  const cleanText = text.replace(/[#*`_~]/g, "");
+  const utterance = new SpeechSynthesisUtterance(cleanText);
+  
+  const bestVoice = getBestSpeechVoice(gender);
+  if (bestVoice) {
+    utterance.voice = bestVoice;
+    utterance.lang = bestVoice.lang;
+    console.log(`TTS voice matched: voice=${bestVoice.name}, lang=${bestVoice.lang}`);
+  } else {
+    utterance.lang = "tr-TR"; // default fallback phonetic close matching
+  }
+
+  const speedPref = localStorage.getItem("tts_speed");
+  const speedMultiplier = speedPref ? parseFloat(speedPref) : 1.0;
+
+  // Pitch and rate configs based on voice preference to sound extremely different
+  if (gender === "male") {
+    utterance.pitch = 0.68; // Deep masculine pitch
+    utterance.rate = 0.88 * speedMultiplier;  // Slightly measured masculine pace
+  } else {
+    utterance.pitch = 1.35; // Beautiful feminine high pitch
+    utterance.rate = 1.05 * speedMultiplier;  // Lively pace
+  }
+
+  utterance.onend = () => {
+    onEnd();
+  };
+
+  utterance.onerror = (e: any) => {
+    console.error("SpeechSynthesis error", e);
+    if (e.error === "interrupted" || e.error === "canceled" || e.error === "removed" || !e.error) {
+      onEnd();
+      return;
+    }
+    // Absolute fallback: Google Translate proxy
+    const url = `/api/learning/tts-proxy?q=${encodeURIComponent(text)}`;
+    const audio = new Audio(url);
+    currentAudio = audio;
+    audio.onended = () => {
+      onEnd();
+    };
+    audio.onerror = () => {
+      onEnd();
+    };
+    audio.play().catch(() => {
+      onEnd();
+    });
+  };
+
+  browserUtterance = utterance;
+  window.speechSynthesis.speak(utterance);
+};
